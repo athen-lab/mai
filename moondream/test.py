@@ -23,7 +23,7 @@ pathlib.Path("./samples").mkdir(parents=True, exist_ok=True)
 img = Image.open("samples/Untitled.jpg")
 md_answer = moondream.answer_question(
     moondream.encode_image(img),
-    "Describe this image.",
+    "Is this image AI generated?",
     tokenizer=tokenizer,
     num_beams=4,
     no_repeat_ngram_size=5,

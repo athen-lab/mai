@@ -1,8 +1,10 @@
+MOONDREAM_REVISION = "2024-08-26"
+
 TEST_SIZE = 0.2
 
 # Number of times to repeat the training dataset. Increasing this may cause the model to overfit or
 # lose generalization due to catastrophic forgetting. Decreasing it may cause the model to underfit.
-EPOCHS = 1
+EPOCHS = 2
 
 # Number of samples to process in each batch. Set this to the highest value that doesn't cause an
 # out-of-memory error. Decrease it if you're running out of memory.
@@ -10,7 +12,7 @@ BATCH_SIZE = 8
 
 # Number of batches to process before updating the model. You can use this to simulate a higher batch
 # size than your GPU can handle. Set this to 1 to disable gradient accumulation.
-GRAD_ACCUM_STEPS = 2
+GRAD_ACCUM_STEPS = 1
 
 # Learning rate for the Adam optimizer. Needs to be tuned on a case-by-case basis. As a general rule
 # of thumb, increase it by 1.4 times each time you double the effective batch size.
