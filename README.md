@@ -13,8 +13,8 @@ directories live under ignored `.mai-data/`.
 
 ## Start here
 
-ImageMagick 7 is required for deterministic normalization. Install the Hub and
-generation clients, then start the workbench:
+ImageMagick 7 is required for deterministic normalization. Install the
+generation, Parquet, and Hub clients, then start the workbench:
 
 ```bash
 ./install.sh
@@ -22,11 +22,21 @@ hf auth login
 python3 -m mai
 ```
 
+With Nix, enter the pinned development shell first. It creates and activates
+an ignored `.venv` with Python 3.12:
+
+```bash
+nix develop "path:$PWD"
+./install.sh
+```
+
 `Build dataset` is the first workbench operation. Its popup lets you select
 exact semantic groups from the build spec. Build downloads screened camera
 photographs and generates every synthetic counterpart on demand, caches those
-inputs, normalizes them, and validates the local package. Synthetic images are
-generated locally with Diffusers—no paid image-generation API is configured.
+inputs, normalizes them, embeds the analysis images and typed metadata in
+Parquet shards, and validates the local package. Byte-identical originals and
+provenance receipts remain as audit sidecars. Synthetic images are generated
+locally with Diffusers—no paid image-generation API is configured.
 The same path builds three groups for a smoke test or all 200 groups for the
 preliminary run.
 

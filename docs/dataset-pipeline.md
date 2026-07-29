@@ -19,7 +19,9 @@ For the selected groups, Build runs this sequence:
 7. Cache the acquired and generated inputs with checksummed receipts.
 8. Retain byte-identical originals and create deterministic 512×512 RGB PNG
    analysis versions with ImageMagick.
-9. Validate the complete group matrix and write a local Hugging Face package.
+9. Embed the normalized PNG bytes and explicitly typed sample metadata in
+   group-aligned Parquet shards.
+10. Validate the complete group matrix and write a local Hugging Face package.
 
 No separate cache-population step is required. The cache is an internal,
 reusable stage of Build. A prompt, slot, seed, or model-configuration change
@@ -33,8 +35,8 @@ an incomplete run cannot become a release.
 
 ## Install and authenticate
 
-ImageMagick 7 must provide the `magick` command. Install the Python generation
-and Hub clients with:
+ImageMagick 7 must provide the `magick` command. Install the Python generation,
+Parquet, and Hub clients with:
 
 ```bash
 ./install.sh
@@ -156,6 +158,10 @@ The root object has:
 | `samples` | array | Legacy manual flat samples; used instead of `groups`. |
 | `samples_file` | string | Legacy manual JSONL path; used instead of `groups`. |
 
+Build specifications remain schema `2.0.0`. The produced package contract is
+schema `3.0.0`; the validator and pull command also retain read compatibility
+with published schema-`2.0.0` ImageFolder packages.
+
 ### Dataset fields
 
 | Field | Type | Meaning |
@@ -242,16 +248,22 @@ The ignored `.mai-data/` directory is the default local workspace:
     ├── dataset.json               release/model contract and spec checksum
     ├── groups.json                compact group index
     ├── validation_report.json     integrity/design audit
-    ├── data/<split>/
-    │   ├── images/*.png           normalized analysis images
-    │   └── metadata.jsonl         ImageFolder sample table
+    ├── data/<split>-<shard>.parquet
+    │                               typed rows and embedded normalized PNGs
     ├── originals/<origin>/*       byte-identical originals
     └── receipts/*.json            per-sample provenance evidence
 ```
 
-`metadata.jsonl` replaces the old `manifest.jsonl`, `acquisition.jsonl`, and
-prompt table. A long metadata table is expected; Hugging Face versions it with
-the dataset.
+Parquet is the canonical analysis layer. Shards are capped near 256 MiB and
+never split a semantic group. `dataset.json` records every shard's path,
+checksum, byte count, and row count; `groups.json` maps each group to its shard
+so exact-group retrieval downloads only relevant data files. Normalized images
+use Hugging Face's typed `Image` feature with embedded PNG bytes. Originals and
+receipts remain individually addressable audit sidecars.
+
+Stable provenance fields are typed nested columns. Each nested provenance
+object also carries canonical `details_json`, preserving adapter-specific or
+future fields without allowing smoke-run inference to change the Arrow schema.
 
 Validate and publish only after Build succeeds:
 
@@ -291,7 +303,10 @@ The builder and validator enforce:
 - camera evidence and text-to-image-only synthetic receipts;
 - explicit in-scope status with no ambiguity flags;
 - byte-identical originals with SHA-256 and byte counts;
-- deterministic 512×512, 8-bit RGB PNG normalized images without metadata;
+- deterministic embedded 512×512, 8-bit RGB PNG normalized images without
+  metadata;
+- explicit Parquet and Hugging Face feature schemas, shard checksums, byte
+  counts, and row counts;
 - unique original and normalized image content;
 - a group index equal to the unified metadata.
 

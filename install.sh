@@ -6,4 +6,4 @@ if ! command -v magick >/dev/null 2>&1; then
     exit 1
 fi
 
-python3 -m pip install -e '.[hub,generation]'
+python3 -m pip install -e '.[hub,parquet,generation]'
