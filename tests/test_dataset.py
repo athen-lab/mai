@@ -14,9 +14,13 @@ import zlib
 from mai.dataset import (
     PipelineError,
     build_package,
+    group_index_from_records,
     list_spec_groups,
+    read_parquet_records,
     read_json,
     validate_package,
+    write_json,
+    write_jsonl,
 )
 from mai.hub import list_remote_groups, publish_package, pull_groups
 
@@ -183,10 +187,39 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(report["status"], "pass")
         self.assertEqual(report["group_count"], 2)
         self.assertEqual(report["sample_count"], 6)
-        self.assertTrue((self.package / "data/train/metadata.jsonl").is_file())
+        parquet_files = sorted((self.package / "data").glob("train-*.parquet"))
+        self.assertEqual(len(parquet_files), 1)
+        self.assertFalse((self.package / "data/train/images").exists())
+        self.assertFalse((self.package / "data/train/metadata.jsonl").exists())
         self.assertTrue((self.package / "originals/camera/camera").is_dir())
         self.assertFalse((self.package / "manifest.jsonl").exists())
         self.assertFalse((self.package / "acquisition.jsonl").exists())
+        contract = read_json(self.package / "dataset.json")
+        self.assertEqual(contract["schema_version"], "3.0.0")
+        self.assertEqual(contract["files"]["data"]["train"][0]["rows"], 6)
+
+        from datasets import Dataset, Image, load_dataset
+
+        dataset = Dataset.from_parquet(
+            str(parquet_files[0]),
+            cache_dir=str(self.root / "datasets-cache"),
+        )
+        self.assertIsInstance(dataset.features["image"], Image)
+        undecoded = dataset.cast_column("image", Image(decode=False))
+        image = undecoded[0]["image"]
+        self.assertIsInstance(image["bytes"], bytes)
+        self.assertTrue(image["path"].endswith(".png"))
+        self.assertEqual(
+            undecoded.features["scope"]["ambiguity_flags"].feature.dtype,
+            "string",
+        )
+        loaded = load_dataset(
+            str(self.package),
+            cache_dir=str(self.root / "hub-layout-cache"),
+        )
+        self.assertEqual(loaded.num_rows["train"], 6)
+        self.assertIsInstance(loaded["train"].features["image"], Image)
+        self.assertEqual(loaded["train"][0]["image"].size, (512, 512))
         status, validation = validate_package(self.package)
         self.assertEqual(status, 0, validation)
 
@@ -268,6 +301,58 @@ class DatasetPipelineTests(unittest.TestCase):
             any("checksum mismatch" in error for error in report["errors"]),
             report,
         )
+
+    def test_tampered_parquet_fails_checksum(self) -> None:
+        build_package(self.spec, self.package)
+        parquet = next((self.package / "data").glob("*.parquet"))
+        parquet.write_bytes(parquet.read_bytes() + b"tampered")
+        status, report = validate_package(self.package)
+        self.assertEqual(status, 1)
+        self.assertTrue(
+            any(
+                "checksum mismatch" in error or "cannot read Parquet" in error
+                for error in report["errors"]
+            ),
+            report,
+        )
+
+    def test_validator_remains_compatible_with_schema_2_jsonl(self) -> None:
+        build_package(self.spec, self.package)
+        parquet = next((self.package / "data").glob("*.parquet"))
+        records = read_parquet_records(parquet)
+        for record in records:
+            relative = (
+                Path("data")
+                / record["split"]
+                / "images"
+                / record["normalized_file_name"]
+            )
+            target = self.package / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(record.pop("image")["bytes"])
+            record["schema_version"] = "2.0.0"
+            record["normalized_path"] = relative.as_posix()
+            record.pop("normalized_file_name")
+            record.pop("data_file")
+        metadata = self.package / "data/train/metadata.jsonl"
+        write_jsonl(metadata, records)
+        contract = read_json(self.package / "dataset.json")
+        contract["schema_version"] = "2.0.0"
+        contract["files"].pop("data")
+        contract["files"]["metadata"] = {
+            "train": "data/train/metadata.jsonl",
+        }
+        write_json(self.package / "dataset.json", contract)
+        write_json(
+            self.package / "groups.json",
+            group_index_from_records(
+                contract["dataset_id"],
+                records,
+                schema_version="2.0.0",
+            ),
+        )
+        status, report = validate_package(self.package)
+        self.assertEqual(status, 0, report)
 
     def test_cli_build_and_validate(self) -> None:
         result = subprocess.run(

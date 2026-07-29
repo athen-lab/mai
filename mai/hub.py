@@ -10,12 +10,17 @@ import tempfile
 from typing import Any
 
 from .dataset import (
+    LEGACY_PACKAGE_SCHEMA_VERSION,
+    PACKAGE_SCHEMA_VERSION,
     PipelineError,
+    dataset_card,
     group_index_from_records,
+    read_parquet_records,
     read_json,
     read_jsonl,
     safe_path,
     validate_package,
+    write_parquet_split,
     write_json,
     write_jsonl,
 )
@@ -211,31 +216,79 @@ def pull_groups(
     try:
         selected_records: list[dict[str, Any]] = []
         records_by_split: dict[str, list[dict[str, Any]]] = {}
-        for split, relative in contract["files"]["metadata"].items():
-            remote_metadata = remote_file(
-                repo_id,
-                relative,
-                revision,
-                token=token,
-                downloader=downloader,
+        package_schema = contract.get("schema_version")
+        if package_schema == PACKAGE_SCHEMA_VERSION:
+            entries_by_path: dict[str, tuple[str, dict[str, Any]]] = {}
+            for split, entries in contract.get("files", {}).get("data", {}).items():
+                if not isinstance(entries, list):
+                    raise PipelineError(f"{split}: invalid Parquet shard list")
+                for entry in entries:
+                    if not isinstance(entry, dict) or not isinstance(
+                        entry.get("path"), str
+                    ):
+                        raise PipelineError(f"{split}: invalid Parquet shard entry")
+                    entries_by_path[entry["path"]] = (split, entry)
+            required_shards = {
+                group.get("data_file") for group in selected_groups
+            }
+            if not all(isinstance(path, str) for path in required_shards):
+                raise PipelineError("remote group index has no Parquet shard mapping")
+            unknown_shards = set(required_shards) - set(entries_by_path)
+            if unknown_shards:
+                raise PipelineError(
+                    "remote group index references unknown Parquet shards: "
+                    + ", ".join(sorted(unknown_shards))
+                )
+            for relative in sorted(required_shards):
+                split, _ = entries_by_path[relative]
+                remote_data = remote_file(
+                    repo_id,
+                    relative,
+                    revision,
+                    token=token,
+                    downloader=downloader,
+                )
+                records = [
+                    record
+                    for record in read_parquet_records(remote_data)
+                    if record.get("sample_id") in selected_ids
+                ]
+                if records:
+                    records_by_split.setdefault(split, []).extend(records)
+                    selected_records.extend(records)
+        elif package_schema == LEGACY_PACKAGE_SCHEMA_VERSION:
+            for split, relative in contract["files"]["metadata"].items():
+                remote_metadata = remote_file(
+                    repo_id,
+                    relative,
+                    revision,
+                    token=token,
+                    downloader=downloader,
+                )
+                records = [
+                    record
+                    for record in read_jsonl(remote_metadata)
+                    if record.get("sample_id") in selected_ids
+                ]
+                if records:
+                    records_by_split[split] = records
+                    selected_records.extend(records)
+        else:
+            raise PipelineError(
+                f"unsupported remote package schema_version: {package_schema!r}"
             )
-            records = [
-                record
-                for record in read_jsonl(remote_metadata)
-                if record.get("sample_id") in selected_ids
-            ]
-            if records:
-                records_by_split[split] = records
-                selected_records.extend(records)
         if {record["sample_id"] for record in selected_records} != selected_ids:
             raise PipelineError("remote metadata is missing selected samples")
         file_paths = {
             relative
             for record in selected_records
             for relative in (
-                record["receipt_path"],
-                record["original_path"],
-                record["normalized_path"],
+                [record["receipt_path"], record["original_path"]]
+                + (
+                    [record["normalized_path"]]
+                    if package_schema == LEGACY_PACKAGE_SCHEMA_VERSION
+                    else []
+                )
             )
         }
         for relative in sorted(file_paths):
@@ -259,17 +312,37 @@ def pull_groups(
             "semantic_groups": group_ids,
             "sample_count": len(selected_records),
         }
-        selected_contract["files"]["metadata"] = {}
-        for split, records in records_by_split.items():
-            relative = f"data/{split}/metadata.jsonl"
-            write_jsonl(staging / relative, records)
-            selected_contract["files"]["metadata"][split] = relative
+        if package_schema == PACKAGE_SCHEMA_VERSION:
+            selected_contract["files"].pop("metadata", None)
+            selected_contract["files"]["data"] = {}
+            for split, records in records_by_split.items():
+                selected_contract["files"]["data"][split] = write_parquet_split(
+                    staging,
+                    split,
+                    records,
+                )
+        else:
+            selected_contract["files"]["metadata"] = {}
+            for split, records in records_by_split.items():
+                relative = f"data/{split}/metadata.jsonl"
+                write_jsonl(staging / relative, records)
+                selected_contract["files"]["metadata"][split] = relative
         write_json(staging / "dataset.json", selected_contract)
         write_json(
             staging / "groups.json",
-            group_index_from_records(contract["dataset_id"], selected_records),
+            group_index_from_records(
+                contract["dataset_id"],
+                selected_records,
+                schema_version=package_schema,
+            ),
         )
-        shutil.copyfile(card_path, staging / "README.md")
+        if package_schema == PACKAGE_SCHEMA_VERSION:
+            (staging / "README.md").write_text(
+                dataset_card(selected_contract),
+                encoding="utf-8",
+            )
+        else:
+            shutil.copyfile(card_path, staging / "README.md")
         status, report = validate_package(staging)
         write_json(staging / "validation_report.json", report)
         if status:

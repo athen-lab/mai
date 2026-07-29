@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import mimetypes
 import os
@@ -19,7 +20,15 @@ from typing import Any, Iterable
 from . import __version__
 
 
-SCHEMA_VERSION = "2.0.0"
+BUILD_SPEC_SCHEMA_VERSION = "2.0.0"
+PACKAGE_SCHEMA_VERSION = "3.0.0"
+LEGACY_PACKAGE_SCHEMA_VERSION = "2.0.0"
+SUPPORTED_PACKAGE_SCHEMA_VERSIONS = {
+    LEGACY_PACKAGE_SCHEMA_VERSION,
+    PACKAGE_SCHEMA_VERSION,
+}
+PARQUET_SHARD_TARGET_BYTES = 256 * 1024 * 1024
+PARQUET_ROW_GROUP_SIZE = 100
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 NORMALIZATION = {
@@ -43,7 +52,8 @@ class PipelineError(RuntimeError):
 
 
 class Validation:
-    def __init__(self) -> None:
+    def __init__(self, schema_version: str = PACKAGE_SCHEMA_VERSION) -> None:
+        self.schema_version = schema_version
         self.errors: list[str] = []
         self.warnings: list[str] = []
         self.checks = 0
@@ -60,7 +70,7 @@ class Validation:
 
     def report(self, **summary: Any) -> dict[str, Any]:
         return {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": self.schema_version,
             "status": "pass" if not self.errors else "fail",
             "checks": self.checks,
             "errors": self.errors,
@@ -151,9 +161,10 @@ def require_id(value: Any, field: str) -> str:
 
 def load_spec(spec_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     spec = read_json(spec_path)
-    if spec.get("schema_version") != SCHEMA_VERSION:
+    if spec.get("schema_version") != BUILD_SPEC_SCHEMA_VERSION:
         raise PipelineError(
-            f"build spec schema_version must be {SCHEMA_VERSION!r}"
+            "build spec schema_version must be "
+            f"{BUILD_SPEC_SCHEMA_VERSION!r}"
         )
     samples = spec.get("samples")
     samples_file = spec.get("samples_file")
@@ -534,30 +545,29 @@ def image_info(path: Path) -> dict[str, Any]:
     }
 
 
-def png_info(path: Path) -> dict[str, Any]:
+def _png_info_stream(handle: Any, source: str) -> dict[str, Any]:
     chunks: list[str] = []
-    with path.open("rb") as handle:
-        if handle.read(8) != PNG_SIGNATURE:
-            raise PipelineError(f"{path}: not a PNG")
-        width = height = bit_depth = color_type = None
-        while True:
-            length_bytes = handle.read(4)
-            if len(length_bytes) != 4:
-                raise PipelineError(f"{path}: truncated PNG")
-            length = struct.unpack(">I", length_bytes)[0]
-            chunk_type = handle.read(4)
-            data = handle.read(length)
-            crc = handle.read(4)
-            if len(chunk_type) != 4 or len(data) != length or len(crc) != 4:
-                raise PipelineError(f"{path}: truncated PNG chunk")
-            name = chunk_type.decode("ascii", errors="replace")
-            chunks.append(name)
-            if name == "IHDR":
-                width, height, bit_depth, color_type = struct.unpack(
-                    ">IIBB", data[:10]
-                )
-            if name == "IEND":
-                break
+    if handle.read(8) != PNG_SIGNATURE:
+        raise PipelineError(f"{source}: not a PNG")
+    width = height = bit_depth = color_type = None
+    while True:
+        length_bytes = handle.read(4)
+        if len(length_bytes) != 4:
+            raise PipelineError(f"{source}: truncated PNG")
+        length = struct.unpack(">I", length_bytes)[0]
+        chunk_type = handle.read(4)
+        data = handle.read(length)
+        crc = handle.read(4)
+        if len(chunk_type) != 4 or len(data) != length or len(crc) != 4:
+            raise PipelineError(f"{source}: truncated PNG chunk")
+        name = chunk_type.decode("ascii", errors="replace")
+        chunks.append(name)
+        if name == "IHDR":
+            width, height, bit_depth, color_type = struct.unpack(
+                ">IIBB", data[:10]
+            )
+        if name == "IEND":
+            break
     return {
         "width": width,
         "height": height,
@@ -565,6 +575,15 @@ def png_info(path: Path) -> dict[str, Any]:
         "color_type": color_type,
         "chunks": chunks,
     }
+
+
+def png_info(path: Path) -> dict[str, Any]:
+    with path.open("rb") as handle:
+        return _png_info_stream(handle, str(path))
+
+
+def png_info_bytes(payload: bytes, source: str) -> dict[str, Any]:
+    return _png_info_stream(io.BytesIO(payload), source)
 
 
 def normalize(source: Path, target: Path, profile: dict[str, Any]) -> None:
@@ -616,10 +635,390 @@ def receipt_for(spec_path: Path, sample: dict[str, Any]) -> dict[str, Any]:
     return read_json(path)
 
 
+def _parquet_symbols() -> tuple[Any, Any, Any, Any, Any, Any]:
+    try:
+        from datasets import Dataset, Features, Image, Sequence, Value
+        import pyarrow.parquet as parquet
+    except ImportError as error:
+        raise PipelineError(
+            "Parquet dataset support is not installed. "
+            "Install with `python3 -m pip install -e '.[parquet]'`."
+        ) from error
+    return Dataset, Features, Image, Sequence, Value, parquet
+
+
+def parquet_features() -> Any:
+    _, Features, Image, Sequence, Value, _ = _parquet_symbols()
+    string = Value("string")
+    integer = Value("int64")
+    floating = Value("float64")
+    boolean = Value("bool")
+    return Features(
+        {
+            "schema_version": string,
+            "sample_id": string,
+            "semantic_group_id": string,
+            "slot_id": string,
+            "prompt_id": string,
+            "prompt": string,
+            "prompt_frozen": boolean,
+            "origin_class": string,
+            "content_category": string,
+            "split": string,
+            "source": {
+                "collection_id": string,
+                "source_record_id": string,
+                "landing_page_url": string,
+                "license": {
+                    "name": string,
+                    "url": string,
+                },
+                "details_json": string,
+            },
+            "capture": {
+                "camera_make": string,
+                "camera_model": string,
+                "captured_at": string,
+                "edit_screen_status": string,
+                "software": string,
+                "details_json": string,
+            },
+            "generation": {
+                "family_id": string,
+                "model_id": string,
+                "model_revision": string,
+                "provider": string,
+                "settings": {
+                    "width": integer,
+                    "height": integer,
+                    "num_inference_steps": integer,
+                    "guidance_scale": floating,
+                    "negative_prompt": string,
+                    "max_sequence_length": integer,
+                },
+                "input_image_used": boolean,
+                "seed_status": string,
+                "seed": integer,
+                "details_json": string,
+            },
+            "scope": {
+                "in_scope": boolean,
+                "ambiguity_flags": Sequence(string),
+                "details_json": string,
+            },
+            "audit": {
+                "selection_method": string,
+                "automated_edit_screen": boolean,
+                "cache_hit": boolean,
+                "details_json": string,
+            },
+            "receipt_path": string,
+            "receipt_sha256": string,
+            "original_path": string,
+            "original_sha256": string,
+            "original_bytes": integer,
+            "original_media_type": string,
+            "original_width": integer,
+            "original_height": integer,
+            "image": Image(),
+            "normalized_file_name": string,
+            "normalized_sha256": string,
+            "normalized_bytes": integer,
+            "normalized_width": integer,
+            "normalized_height": integer,
+            "normalization_id": string,
+            "data_file": string,
+        }
+    )
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _typed_source(value: dict[str, Any]) -> dict[str, Any]:
+    license_record = value.get("license")
+    if not isinstance(license_record, dict):
+        license_record = {}
+    return {
+        "collection_id": value.get("collection_id"),
+        "source_record_id": value.get("source_record_id"),
+        "landing_page_url": value.get("landing_page_url"),
+        "license": {
+            "name": license_record.get("name"),
+            "url": license_record.get("url"),
+        },
+        "details_json": _canonical_json(value),
+    }
+
+
+def _typed_capture(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        "camera_make": value.get("camera_make"),
+        "camera_model": value.get("camera_model"),
+        "captured_at": value.get("captured_at"),
+        "edit_screen_status": value.get("edit_screen_status"),
+        "software": value.get("software"),
+        "details_json": _canonical_json(value),
+    }
+
+
+def _typed_generation(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    settings = value.get("settings")
+    if not isinstance(settings, dict):
+        settings = {}
+    return {
+        "family_id": value.get("family_id"),
+        "model_id": value.get("model_id"),
+        "model_revision": value.get("model_revision"),
+        "provider": value.get("provider"),
+        "settings": {
+            "width": settings.get("width"),
+            "height": settings.get("height"),
+            "num_inference_steps": settings.get("num_inference_steps"),
+            "guidance_scale": settings.get("guidance_scale"),
+            "negative_prompt": settings.get("negative_prompt"),
+            "max_sequence_length": settings.get("max_sequence_length"),
+        },
+        "input_image_used": value.get("input_image_used"),
+        "seed_status": value.get("seed_status"),
+        "seed": value.get("seed"),
+        "details_json": _canonical_json(value),
+    }
+
+
+def _typed_scope(value: dict[str, Any]) -> dict[str, Any]:
+    flags = value.get("ambiguity_flags")
+    if not isinstance(flags, list):
+        flags = []
+    return {
+        "in_scope": value.get("in_scope"),
+        "ambiguity_flags": flags,
+        "details_json": _canonical_json(value),
+    }
+
+
+def _typed_audit(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {}
+    return {
+        "selection_method": value.get("selection_method"),
+        "automated_edit_screen": value.get("automated_edit_screen"),
+        "cache_hit": value.get("cache_hit"),
+        "details_json": _canonical_json(value),
+    }
+
+
+def _parquet_record(record: dict[str, Any]) -> dict[str, Any]:
+    image = record.get("image")
+    if not isinstance(image, dict) or not isinstance(image.get("bytes"), bytes):
+        internal_path = record.get("_normalized_path")
+        if not isinstance(internal_path, str):
+            raise PipelineError(
+                f"{record.get('sample_id')}: normalized image bytes are missing"
+            )
+        image = {
+            "path": record["normalized_file_name"],
+            "bytes": Path(internal_path).read_bytes(),
+        }
+    return {
+        "schema_version": record["schema_version"],
+        "sample_id": record["sample_id"],
+        "semantic_group_id": record["semantic_group_id"],
+        "slot_id": record["slot_id"],
+        "prompt_id": record["prompt_id"],
+        "prompt": record["prompt"],
+        "prompt_frozen": record["prompt_frozen"],
+        "origin_class": record["origin_class"],
+        "content_category": record["content_category"],
+        "split": record["split"],
+        "source": _typed_source(record["source"]),
+        "capture": _typed_capture(record.get("capture")),
+        "generation": _typed_generation(record.get("generation")),
+        "scope": _typed_scope(record["scope"]),
+        "audit": _typed_audit(record.get("audit")),
+        "receipt_path": record["receipt_path"],
+        "receipt_sha256": record["receipt_sha256"],
+        "original_path": record["original_path"],
+        "original_sha256": record["original_sha256"],
+        "original_bytes": record["original_bytes"],
+        "original_media_type": record["original_media_type"],
+        "original_width": record["original_width"],
+        "original_height": record["original_height"],
+        "image": image,
+        "normalized_file_name": record["normalized_file_name"],
+        "normalized_sha256": record["normalized_sha256"],
+        "normalized_bytes": record["normalized_bytes"],
+        "normalized_width": record["normalized_width"],
+        "normalized_height": record["normalized_height"],
+        "normalization_id": record["normalization_id"],
+        "data_file": record["data_file"],
+    }
+
+
+def _hydrate_parquet_record(record: dict[str, Any]) -> dict[str, Any]:
+    for field in ("source", "capture", "generation", "scope", "audit"):
+        value = record.get(field)
+        if not isinstance(value, dict):
+            continue
+        details = value.get("details_json")
+        if not isinstance(details, str):
+            continue
+        try:
+            decoded = json.loads(details)
+        except json.JSONDecodeError as error:
+            raise PipelineError(
+                f"{record.get('sample_id')}: invalid {field}.details_json"
+            ) from error
+        if not isinstance(decoded, dict):
+            raise PipelineError(
+                f"{record.get('sample_id')}: {field}.details_json is not an object"
+            )
+        record[field] = decoded
+    return record
+
+
+def _partition_parquet_records(
+    records: list[dict[str, Any]],
+    target_bytes: int,
+) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    current_group: list[dict[str, Any]] = []
+    current_group_id: str | None = None
+    for record in records:
+        group_id = record["semantic_group_id"]
+        if current_group and group_id != current_group_id:
+            groups.append(current_group)
+            current_group = []
+        current_group_id = group_id
+        current_group.append(record)
+    if current_group:
+        groups.append(current_group)
+
+    shards: list[list[dict[str, Any]]] = []
+    current_shard: list[dict[str, Any]] = []
+    current_bytes = 0
+    for group in groups:
+        group_bytes = sum(int(record["normalized_bytes"]) for record in group)
+        if current_shard and current_bytes + group_bytes > target_bytes:
+            shards.append(current_shard)
+            current_shard = []
+            current_bytes = 0
+        current_shard.extend(group)
+        current_bytes += group_bytes
+    if current_shard:
+        shards.append(current_shard)
+    return shards
+
+
+def write_parquet_split(
+    package: Path,
+    split: str,
+    records: list[dict[str, Any]],
+    *,
+    target_bytes: int = PARQUET_SHARD_TARGET_BYTES,
+) -> list[dict[str, Any]]:
+    if not records:
+        return []
+    Dataset, _, _, _, _, _ = _parquet_symbols()
+    ordered = sorted(
+        records,
+        key=lambda item: (
+            item["semantic_group_id"],
+            item["slot_id"],
+            item["sample_id"],
+        ),
+    )
+    shards = _partition_parquet_records(ordered, target_bytes)
+    entries: list[dict[str, Any]] = []
+    for index, shard in enumerate(shards):
+        relative = Path("data") / (
+            f"{split}-{index:05d}-of-{len(shards):05d}.parquet"
+        )
+        for record in shard:
+            record["data_file"] = relative.as_posix()
+        rows = [_parquet_record(record) for record in shard]
+        dataset = Dataset.from_list(rows, features=parquet_features())
+        target = package / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        dataset.to_parquet(
+            target,
+            batch_size=min(PARQUET_ROW_GROUP_SIZE, len(rows)),
+        )
+        entries.append(
+            {
+                "path": relative.as_posix(),
+                "sha256": sha256(target),
+                "bytes": target.stat().st_size,
+                "rows": len(rows),
+            }
+        )
+    return entries
+
+
+def read_parquet_records(path: Path) -> list[dict[str, Any]]:
+    _, _, _, _, _, parquet = _parquet_symbols()
+    try:
+        table = parquet.read_table(path)
+    except Exception as error:
+        raise PipelineError(f"cannot read Parquet {path}: {error}") from error
+    return [_hydrate_parquet_record(record) for record in table.to_pylist()]
+
+
+def parquet_schema_errors(path: Path) -> list[str]:
+    _, _, _, _, _, parquet = _parquet_symbols()
+    try:
+        schema = parquet.read_schema(path)
+    except Exception as error:
+        return [f"cannot read Parquet schema {path}: {error}"]
+    expected_names = list(parquet_features())
+    errors: list[str] = []
+    if schema.names != expected_names:
+        errors.append(f"{path}: Parquet columns differ from schema 3.0.0")
+    metadata = schema.metadata or {}
+    if b"huggingface" not in metadata:
+        errors.append(f"{path}: Hugging Face feature metadata is missing")
+    try:
+        image_type = schema.field("image").type
+        image_fields = {field.name: str(field.type) for field in image_type}
+        if image_fields != {"bytes": "binary", "path": "string"}:
+            errors.append(f"{path}: image is not a bytes/path struct")
+        scope_type = schema.field("scope").type
+        flags_type = scope_type.field("ambiguity_flags").type
+        if str(flags_type.value_type) != "string":
+            errors.append(f"{path}: ambiguity_flags is not list<string>")
+    except (KeyError, TypeError, ValueError):
+        errors.append(f"{path}: required nested Parquet fields are missing")
+    return errors
+
+
 def dataset_card(contract: dict[str, Any]) -> str:
     title = contract["title"]
     description = contract["description"]
     license_name = contract["license"]
+    data_files = contract.get("files", {}).get("data", {})
+    config_lines = [
+        "configs:",
+        "- config_name: default",
+        "  data_files:",
+    ]
+    for split in sorted(data_files):
+        config_lines.extend(
+            [
+                f"  - split: {split}",
+                f"    path: data/{split}-*.parquet",
+            ]
+        )
+    configs = "\n".join(config_lines)
     return f"""---
 pretty_name: {json.dumps(title)}
 license: other
@@ -630,6 +1029,7 @@ tags:
 - image-forensics
 - ai-generated-image-detection
 - camera-provenance
+{configs}
 ---
 
 # {title}
@@ -637,12 +1037,12 @@ tags:
 {description}
 
 This repository is produced by the MAI provenance-first dataset pipeline.
-Normalized images are exposed through Hugging Face `ImageFolder`; byte-identical
-originals, provenance receipts, checksums, generator settings, and semantic-group
-relationships are retained for audit.
+Normalized images and their typed metadata are embedded in Parquet; byte-identical
+originals, provenance receipts, checksums, generator settings, and
+semantic-group relationships are retained for audit.
 
 Dataset-specific license identifier: `{license_name}`. Per-sample source licenses
-in `data/*/metadata.jsonl` govern the corresponding artifacts.
+in `data/*.parquet` govern the corresponding artifacts.
 
 Load the normalized analysis images with:
 
@@ -802,7 +1202,7 @@ def build_package(
         dataset_spec = spec["dataset"]
         profile = {**NORMALIZATION, **dataset_spec.get("normalization", {})}
         contract = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": PACKAGE_SCHEMA_VERSION,
             "dataset_id": dataset_spec["dataset_id"],
             "title": dataset_spec["title"],
             "description": dataset_spec["description"],
@@ -832,11 +1232,10 @@ def build_package(
             "files": {
                 "group_index": "groups.json",
                 "validation_report": "validation_report.json",
-                "metadata": {},
+                "data": {},
             },
         }
         records_by_split: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        group_rows: dict[str, dict[str, Any]] = {}
         for index, sample in enumerate(
             sorted(
                 samples,
@@ -870,7 +1269,7 @@ def build_package(
             original_info = image_info(original_target)
 
             normalized_relative = (
-                Path("data") / split / "images" / f"{sample_id}.png"
+                Path(".normalized") / split / f"{sample_id}.png"
             )
             normalized_target = staging / normalized_relative
             normalize(original_target, normalized_target, profile)
@@ -881,7 +1280,7 @@ def build_package(
             write_json(staging / receipt_relative, receipt)
 
             record = {
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": PACKAGE_SCHEMA_VERSION,
                 "sample_id": sample_id,
                 "semantic_group_id": group_id,
                 "slot_id": sample["slot_id"],
@@ -906,51 +1305,34 @@ def build_package(
                 ),
                 "original_width": original_info["width"],
                 "original_height": original_info["height"],
-                "file_name": f"images/{sample_id}.png",
-                "normalized_path": normalized_relative.as_posix(),
+                "normalized_file_name": f"{sample_id}.png",
                 "normalized_sha256": sha256(normalized_target),
                 "normalized_bytes": normalized_target.stat().st_size,
                 "normalized_width": normalized_info["width"],
                 "normalized_height": normalized_info["height"],
                 "normalization_id": profile["transformation_id"],
+                "_normalized_path": str(normalized_target),
             }
             records_by_split[split].append(record)
-            group = group_rows.setdefault(
-                group_id,
-                {
-                    "semantic_group_id": group_id,
-                    "prompt_id": record["prompt_id"],
-                    "prompt": record["prompt"],
-                    "content_category": record["content_category"],
-                    "split": split,
-                    "samples": [],
-                },
-            )
-            group["samples"].append(
-                {
-                    "sample_id": sample_id,
-                    "slot_id": record["slot_id"],
-                    "origin_class": record["origin_class"],
-                    "generator_family": (
-                        record["generation"].get("family_id")
-                        if isinstance(record["generation"], dict)
-                        else None
-                    ),
-                    "original_path": record["original_path"],
-                    "normalized_path": record["normalized_path"],
-                }
-            )
             print(f"[{index}/{len(samples)}] {sample_id}")
 
         for split, records in sorted(records_by_split.items()):
-            relative = Path("data") / split / "metadata.jsonl"
-            write_jsonl(staging / relative, records)
-            contract["files"]["metadata"][split] = relative.as_posix()
-        groups = {
-            "schema_version": SCHEMA_VERSION,
-            "dataset_id": contract["dataset_id"],
-            "groups": [group_rows[key] for key in sorted(group_rows)],
-        }
+            contract["files"]["data"][split] = write_parquet_split(
+                staging,
+                split,
+                records,
+            )
+        shutil.rmtree(staging / ".normalized")
+        all_records = [
+            record
+            for records in records_by_split.values()
+            for record in records
+        ]
+        groups = group_index_from_records(
+            contract["dataset_id"],
+            all_records,
+            schema_version=PACKAGE_SCHEMA_VERSION,
+        )
         write_json(staging / "dataset.json", contract)
         write_json(staging / "groups.json", groups)
         (staging / "README.md").write_text(dataset_card(contract), encoding="utf-8")
@@ -975,6 +1357,29 @@ def load_package_records(
     contract: dict[str, Any],
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    schema_version = contract.get("schema_version")
+    if schema_version == PACKAGE_SCHEMA_VERSION:
+        data = contract.get("files", {}).get("data", {})
+        if not isinstance(data, dict) or not data:
+            raise PipelineError("dataset contract has no Parquet data files")
+        for split, entries in data.items():
+            if not isinstance(entries, list) or not entries:
+                raise PipelineError(f"dataset split {split} has no Parquet shards")
+            for entry in entries:
+                if not isinstance(entry, dict) or not isinstance(
+                    entry.get("path"), str
+                ):
+                    raise PipelineError(
+                        f"dataset split {split} has an invalid Parquet shard"
+                    )
+                records.extend(
+                    read_parquet_records(safe_path(package, entry["path"]))
+                )
+        return records
+    if schema_version != LEGACY_PACKAGE_SCHEMA_VERSION:
+        raise PipelineError(
+            f"unsupported dataset schema_version: {schema_version!r}"
+        )
     metadata = contract.get("files", {}).get("metadata", {})
     if not isinstance(metadata, dict) or not metadata:
         raise PipelineError("dataset contract has no metadata files")
@@ -988,6 +1393,8 @@ def load_package_records(
 def group_index_from_records(
     dataset_id: str,
     records: list[dict[str, Any]],
+    *,
+    schema_version: str = PACKAGE_SCHEMA_VERSION,
 ) -> dict[str, Any]:
     groups: dict[str, dict[str, Any]] = {}
     for record in sorted(
@@ -1007,25 +1414,32 @@ def group_index_from_records(
                 "prompt": record["prompt"],
                 "content_category": record["content_category"],
                 "split": record["split"],
+                **(
+                    {"data_file": record["data_file"]}
+                    if schema_version == PACKAGE_SCHEMA_VERSION
+                    else {}
+                ),
                 "samples": [],
             },
         )
-        group["samples"].append(
-            {
-                "sample_id": record["sample_id"],
-                "slot_id": record["slot_id"],
-                "origin_class": record["origin_class"],
-                "generator_family": (
-                    record["generation"].get("family_id")
-                    if isinstance(record.get("generation"), dict)
-                    else None
-                ),
-                "original_path": record["original_path"],
-                "normalized_path": record["normalized_path"],
-            }
-        )
+        sample = {
+            "sample_id": record["sample_id"],
+            "slot_id": record["slot_id"],
+            "origin_class": record["origin_class"],
+            "generator_family": (
+                record["generation"].get("family_id")
+                if isinstance(record.get("generation"), dict)
+                else None
+            ),
+            "original_path": record["original_path"],
+        }
+        if schema_version == PACKAGE_SCHEMA_VERSION:
+            sample["normalized_file_name"] = record["normalized_file_name"]
+        else:
+            sample["normalized_path"] = record["normalized_path"]
+        group["samples"].append(sample)
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_version,
         "dataset_id": dataset_id,
         "groups": [groups[key] for key in sorted(groups)],
     }
@@ -1033,24 +1447,99 @@ def group_index_from_records(
 
 def validate_package(package: Path) -> tuple[int, dict[str, Any]]:
     package = package.resolve()
-    validation = Validation()
     try:
         contract = read_json(package / "dataset.json")
-        records = load_package_records(package, contract)
     except PipelineError as error:
+        validation = Validation()
         report = validation.report(
-            errors=[str(error)],
             group_count=0,
             sample_count=0,
         )
         report["status"] = "fail"
         report["errors"] = [str(error)]
         return 1, report
-
+    package_schema = contract.get("schema_version")
+    validation = Validation(
+        package_schema
+        if isinstance(package_schema, str)
+        else PACKAGE_SCHEMA_VERSION
+    )
     validation.require(
-        contract.get("schema_version") == SCHEMA_VERSION,
+        package_schema in SUPPORTED_PACKAGE_SCHEMA_VERSIONS,
         "unsupported dataset schema_version",
     )
+    try:
+        records = load_package_records(package, contract)
+    except PipelineError as error:
+        report = validation.report(
+            group_count=0,
+            sample_count=0,
+        )
+        report["status"] = "fail"
+        report["errors"].append(str(error))
+        return 1, report
+
+    parquet_paths: set[str] = set()
+    parquet_splits: dict[str, str] = {}
+    if package_schema == PACKAGE_SCHEMA_VERSION:
+        data = contract.get("files", {}).get("data", {})
+        if isinstance(data, dict):
+            for split, entries in data.items():
+                if not isinstance(entries, list):
+                    validation.require(
+                        False,
+                        f"{split}: Parquet shard list is invalid",
+                    )
+                    continue
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        validation.require(
+                            False,
+                            f"{split}: Parquet shard entry is invalid",
+                        )
+                        continue
+                    relative = entry.get("path")
+                    validation.require(
+                        isinstance(relative, str) and bool(relative),
+                        f"{split}: Parquet shard path is missing",
+                    )
+                    if not isinstance(relative, str):
+                        continue
+                    validation.require(
+                        relative not in parquet_paths,
+                        f"Parquet shard path reused: {relative}",
+                    )
+                    parquet_paths.add(relative)
+                    parquet_splits[relative] = split
+                    try:
+                        path = safe_path(package, relative)
+                    except PipelineError as error:
+                        validation.require(False, str(error))
+                        continue
+                    validation.require(
+                        path.is_file(),
+                        f"missing Parquet shard: {relative}",
+                    )
+                    if not path.is_file():
+                        continue
+                    validation.require(
+                        path.stat().st_size == entry.get("bytes"),
+                        f"{relative}: byte count mismatch",
+                    )
+                    validation.require(
+                        sha256(path) == entry.get("sha256"),
+                        f"{relative}: checksum mismatch",
+                    )
+                    for error in parquet_schema_errors(path):
+                        validation.require(False, error)
+                    observed_rows = sum(
+                        record.get("data_file") == relative
+                        for record in records
+                    )
+                    validation.require(
+                        observed_rows == entry.get("rows"),
+                        f"{relative}: row count mismatch",
+                    )
     expected_slots = contract.get("design", {}).get("expected_slots", [])
     expected_slot_ids = {
         slot.get("slot_id") for slot in expected_slots if isinstance(slot, dict)
@@ -1061,16 +1550,18 @@ def validate_package(package: Path) -> tuple[int, dict[str, Any]]:
     validation.require(bool(expected_slot_ids), "dataset has no expected slots")
     ids: set[str] = set()
     paths: set[str] = set()
+    image_names: set[str] = set()
     hashes: set[str] = set()
     group_slots: dict[str, set[str]] = defaultdict(set)
     group_prompts: dict[str, set[tuple[str, str]]] = defaultdict(set)
     group_categories: dict[str, set[str]] = defaultdict(set)
     group_splits: dict[str, set[str]] = defaultdict(set)
+    group_data_files: dict[str, set[str]] = defaultdict(set)
     families: set[str] = set()
     for record in records:
         sample_id = record.get("sample_id", "<missing>")
         validation.require(
-            record.get("schema_version") == SCHEMA_VERSION,
+            record.get("schema_version") == package_schema,
             f"{sample_id}: unsupported schema_version",
         )
         validation.require(sample_id not in ids, f"duplicate sample_id: {sample_id}")
@@ -1128,7 +1619,10 @@ def validate_package(package: Path) -> tuple[int, dict[str, Any]]:
             and scope.get("ambiguity_flags") == [],
             f"{sample_id}: ambiguous or out of scope",
         )
-        for role in ("receipt_path", "original_path", "normalized_path"):
+        file_roles = ["receipt_path", "original_path"]
+        if package_schema == LEGACY_PACKAGE_SCHEMA_VERSION:
+            file_roles.append("normalized_path")
+        for role in file_roles:
             relative = record.get(role)
             validation.require(
                 isinstance(relative, str) and bool(relative),
@@ -1197,6 +1691,76 @@ def validate_package(package: Path) -> tuple[int, dict[str, Any]]:
                         not leaking,
                         f"{sample_id}: normalized metadata remains: {sorted(leaking)}",
                     )
+        if package_schema == PACKAGE_SCHEMA_VERSION:
+            image = record.get("image")
+            payload = image.get("bytes") if isinstance(image, dict) else None
+            logical_path = image.get("path") if isinstance(image, dict) else None
+            validation.require(
+                isinstance(payload, bytes),
+                f"{sample_id}: embedded image bytes are missing",
+            )
+            validation.require(
+                isinstance(logical_path, str)
+                and logical_path == record.get("normalized_file_name"),
+                f"{sample_id}: embedded image filename mismatch",
+            )
+            if isinstance(logical_path, str):
+                validation.require(
+                    logical_path == f"{sample_id}.png",
+                    f"{sample_id}: embedded image filename is not deterministic",
+                )
+                validation.require(
+                    logical_path not in image_names,
+                    f"embedded image filename reused: {logical_path}",
+                )
+                image_names.add(logical_path)
+            validation.require(
+                record.get("data_file") in parquet_paths,
+                f"{sample_id}: data_file is not declared",
+            )
+            validation.require(
+                parquet_splits.get(record.get("data_file")) == record.get("split"),
+                f"{sample_id}: data_file belongs to a different split",
+            )
+            if isinstance(record.get("data_file"), str):
+                group_data_files[group_id].add(record["data_file"])
+            if isinstance(payload, bytes):
+                validation.require(
+                    len(payload) == record.get("normalized_bytes"),
+                    f"{sample_id}: normalized byte count mismatch",
+                )
+                observed_hash = hashlib.sha256(payload).hexdigest()
+                validation.require(
+                    observed_hash == record.get("normalized_sha256"),
+                    f"{sample_id}: embedded image checksum mismatch",
+                )
+                validation.require(
+                    observed_hash not in hashes,
+                    f"image content reused: {observed_hash}",
+                )
+                hashes.add(observed_hash)
+                try:
+                    info = png_info_bytes(payload, f"{sample_id}:image")
+                except PipelineError as error:
+                    validation.require(False, str(error))
+                else:
+                    profile = contract.get("normalization", {})
+                    validation.require(
+                        info["width"] == profile.get("width")
+                        and info["height"] == profile.get("height"),
+                        f"{sample_id}: normalized dimensions differ from profile",
+                    )
+                    validation.require(
+                        info["bit_depth"] == 8 and info["color_type"] == 2,
+                        f"{sample_id}: normalized PNG is not 8-bit RGB",
+                    )
+                    leaking = {"eXIf", "tEXt", "zTXt", "iTXt", "tIME"} & set(
+                        info["chunks"]
+                    )
+                    validation.require(
+                        not leaking,
+                        f"{sample_id}: normalized metadata remains: {sorted(leaking)}",
+                    )
     for group_id in sorted(group_slots):
         validation.require(
             group_slots[group_id] == expected_slot_ids,
@@ -1214,6 +1778,11 @@ def validate_package(package: Path) -> tuple[int, dict[str, Any]]:
             len(group_splits[group_id]) == 1,
             f"{group_id}: split leakage",
         )
+        if package_schema == PACKAGE_SCHEMA_VERSION:
+            validation.require(
+                len(group_data_files[group_id]) == 1,
+                f"{group_id}: semantic group spans Parquet shards",
+            )
     validation.require(
         len(families) >= 2,
         "dataset contains fewer than two generator families",
@@ -1233,7 +1802,11 @@ def validate_package(package: Path) -> tuple[int, dict[str, Any]]:
             len(group_slots) >= target_group_count,
             "full package is below target_group_count",
         )
-    expected_index = group_index_from_records(contract.get("dataset_id"), records)
+    expected_index = group_index_from_records(
+        contract.get("dataset_id"),
+        records,
+        schema_version=package_schema,
+    )
     try:
         observed_index = read_json(package / "groups.json")
     except PipelineError as error:
@@ -1258,7 +1831,7 @@ def initialize_spec(path: Path, *, force: bool = False) -> None:
     if path.exists() and not force:
         raise PipelineError(f"spec already exists: {path}; use --force")
     template = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": BUILD_SPEC_SCHEMA_VERSION,
         "dataset": {
             "dataset_id": "mai-v1",
             "title": "MAI camera-origin versus generated image atlas v1",
