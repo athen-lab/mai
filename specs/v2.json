@@ -1,0 +1,182 @@
+{
+  "schema_version": "2.0.0",
+  "dataset": {
+    "dataset_id": "mai-v2-pilot",
+    "title": "MAI real-photo versus generated-image atlas v2 pilot",
+    "description": "A paired pilot in which pinned public-domain real photographs are deterministically captioned and rendered by every generator family.",
+    "license": "mixed-per-sample",
+    "target_group_count": 3,
+    "seed_base": 1729,
+    "real_source": {
+      "adapter": "huggingface-dataset",
+      "dataset_id": "Spawning/PD12M",
+      "revision": "867988b01138799b89d3ffdd5b4f7e1455951f32",
+      "split": "train",
+      "image_column": "url",
+      "id_column": "id",
+      "license_column": "license",
+      "source_url_column": "url",
+      "source_name_column": "source",
+      "width_column": "width",
+      "height_column": "height",
+      "mime_type_column": "mime_type",
+      "allowed_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/webp"
+      ],
+      "license_policy": {
+        "allowed": [
+          "CC0-1.0"
+        ],
+        "aliases": {
+          "https://creativecommons.org/publicdomain/zero/1.0/": "CC0-1.0"
+        }
+      },
+      "sample_seed": 1729,
+      "shuffle_buffer_size": 10000,
+      "oversample_factor": 40,
+      "metadata_filter_columns": [
+        "caption"
+      ],
+      "metadata_reject_patterns": [
+        "\\b(?:painting|drawing|illustration|diagram|screenshot|screen capture|x-ray|radiograph|scan|scanned|manuscript|map|coin|fossil|specimen|barcode)\\b"
+      ]
+    },
+    "captioning": {
+      "adapter": "moondream-local",
+      "model_id": "vikhyatk/moondream2",
+      "model_revision": "9a7d4024050840e001defacec2b00727e89149e6",
+      "device": "auto",
+      "length": "short",
+      "temperature": 0,
+      "normalization_policy": "content-only-v1"
+    },
+    "prompt_policy": {
+      "template_id": "frozen-caption-v1",
+      "template": "{caption}."
+    },
+    "automated_qa": {
+      "adapter": "clip-local",
+      "model_id": "openai/clip-vit-base-patch32",
+      "model_revision": "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268",
+      "device": "auto",
+      "threshold_policy": "pd12m-moondream-clip-pilot-v1",
+      "alignment_threshold": 0.2,
+      "photo_probability_min": 0.55,
+      "unsafe_probability_max": 0.35,
+      "minimum_dimension": 512,
+      "blank_stddev_min": 2.0,
+      "near_duplicate_hamming_distance": 4
+    },
+    "generation_selection": {
+      "candidates_per_slot": 2,
+      "method": "automatic-first-passing-v1",
+      "quarantine_on_failure": true,
+      "human_audit_rate": 0.05
+    },
+    "generators": {
+      "flux": {
+        "family_id": "flux",
+        "adapter": "local-diffusers",
+        "model_id": "black-forest-labs/FLUX.1-schnell",
+        "model_revision": "741f7c3ce8b383c54771c7003378a50191e9efe9",
+        "device": "auto",
+        "settings": {
+          "width": 1024,
+          "height": 1024,
+          "num_inference_steps": 4,
+          "guidance_scale": 0.0,
+          "max_sequence_length": 256
+        },
+        "output_terms_url": "https://huggingface.co/black-forest-labs/FLUX.1-schnell/blob/741f7c3ce8b383c54771c7003378a50191e9efe9/LICENSE.md"
+      },
+      "stable-diffusion-xl": {
+        "family_id": "stable-diffusion-xl",
+        "adapter": "local-diffusers",
+        "model_id": "stabilityai/stable-diffusion-xl-base-1.0",
+        "model_revision": "462165984030d82259a11f4367a4eed129e94a7b",
+        "device": "auto",
+        "settings": {
+          "width": 1024,
+          "height": 1024,
+          "num_inference_steps": 30,
+          "guidance_scale": 6.0,
+          "negative_prompt": "illustration, drawing, painting, cartoon, CGI, 3D render, graphic design, collage, border, frame, watermark"
+        },
+        "output_terms_url": "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/462165984030d82259a11f4367a4eed129e94a7b/LICENSE.md"
+      },
+      "stable-diffusion-1-5": {
+        "family_id": "stable-diffusion-1-5",
+        "adapter": "local-diffusers",
+        "model_id": "stable-diffusion-v1-5/stable-diffusion-v1-5",
+        "model_revision": "451f4fe16113bff5a5d2269ed5ad43b0592e9a14",
+        "device": "auto",
+        "settings": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 30,
+          "guidance_scale": 7.0,
+          "negative_prompt": "illustration, drawing, painting, cartoon, CGI, 3D render, graphic design, collage, border, frame, watermark"
+        },
+        "output_terms_url": "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/blob/451f4fe16113bff5a5d2269ed5ad43b0592e9a14/LICENSE.md"
+      }
+    },
+    "expected_slots": [
+      {
+        "slot_id": "real-photo",
+        "origin_class": "real_photo"
+      },
+      {
+        "slot_id": "flux-replicate-0",
+        "origin_class": "synthetic",
+        "generator_family": "flux"
+      },
+      {
+        "slot_id": "flux-replicate-1",
+        "origin_class": "synthetic",
+        "generator_family": "flux"
+      },
+      {
+        "slot_id": "stable-diffusion-xl-replicate-0",
+        "origin_class": "synthetic",
+        "generator_family": "stable-diffusion-xl"
+      },
+      {
+        "slot_id": "stable-diffusion-xl-replicate-1",
+        "origin_class": "synthetic",
+        "generator_family": "stable-diffusion-xl"
+      },
+      {
+        "slot_id": "stable-diffusion-1-5-replicate-0",
+        "origin_class": "synthetic",
+        "generator_family": "stable-diffusion-1-5"
+      },
+      {
+        "slot_id": "stable-diffusion-1-5-replicate-1",
+        "origin_class": "synthetic",
+        "generator_family": "stable-diffusion-1-5"
+      }
+    ]
+  },
+  "groups": [
+    {
+      "semantic_group_id": "real-000001",
+      "source_index": 0,
+      "content_category": "unstratified",
+      "split": "train"
+    },
+    {
+      "semantic_group_id": "real-000002",
+      "source_index": 1,
+      "content_category": "unstratified",
+      "split": "validation"
+    },
+    {
+      "semantic_group_id": "real-000003",
+      "source_index": 2,
+      "content_category": "unstratified",
+      "split": "test"
+    }
+  ]
+}

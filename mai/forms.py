@@ -47,7 +47,7 @@ class InitForm:
 
 @dataclass
 class BuildForm:
-    spec: str = "specs/v1.json"
+    spec: str = "specs/v2.json"
     selected_groups: list[str] = field(default_factory=list)
     output: str = ".mai-data/package"
     cache: str = ".mai-data/cache"

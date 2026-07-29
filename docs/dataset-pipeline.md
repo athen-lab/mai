@@ -1,418 +1,282 @@
-# Hugging Face dataset pipeline
+# Hugging Face real-photo pairing pipeline
 
-## What Build does
+## Scope
 
-`specs/v1.json` is the checked-in experiment contract. It contains all 200
-semantic groups, a versioned concept-to-prompt policy, group-locked splits, the
-seven-slot sample matrix, camera acquisition policy, generator configurations,
-and deterministic review policy.
+`specs/v2.json` defines the default paired-data workflow:
 
-For the selected groups, Build runs this sequence:
+```text
+pinned Hugging Face real photograph
+  → deterministic Moondream caption
+  → content-only normalized caption
+  → one frozen generation prompt
+  → two candidates for every synthetic slot
+  → deterministic first passing candidate
+  → auditable Parquet package
+```
 
-1. Validate the complete design before downloading inputs or model weights.
-2. Render one frozen natural-photograph prompt from each semantic concept.
-3. Search Wikimedia Commons for semantically matched JPEGs, preserving actions
-   and relationships in the first query.
-4. Require camera make, camera model, capture time, a compatible license, and
-   no detected editor name in EXIF `Software`.
-5. Download each original photograph and record its source page, license,
-   search query, Commons identifier, EXIF, dimensions, and checksum.
-6. Reject duplicate camera records or bytes before local generation starts.
-7. Generate the configured deterministic candidate pool for every synthetic
-   slot at the generator family's native resolution.
-8. Cache every candidate with a checksummed receipt and write a review manifest.
-9. Require an explicit first-passing decision for every synthetic slot.
-10. Retain byte-identical selected originals and create deterministic 512×512
-    RGB PNG analysis versions with ImageMagick.
-11. Embed the normalized PNG bytes and explicitly typed sample metadata in
-   group-aligned Parquet shards.
-12. Validate the complete group matrix and write a local Hugging Face package.
+The research claim is **real_photo versus synthetic**. A Hugging Face row is
+not described as an unedited camera original unless independent capture
+evidence exists. EXIF is not required and its absence is not interpreted as
+evidence either way.
 
-No separate cache-population step is required. The first real Build generates
-the candidates and then pauses if review decisions are missing. A prompt
-policy, slot, candidate index, seed, model revision, or model-configuration
-change produces a different cache key; a matching entry is reused only when
-its SHA-256 checksum still matches its receipt. The post-review Build reuses
-the candidate cache and does not run inference again.
+`specs/v1.json` remains available for reproducing the earlier
+Wikimedia/camera-evidence workflow. V2 does not change the meaning of v1.
 
-Build does **not** stream records directly into Hugging Face. It finishes and
-validates `.mai-data/package` locally first. Publish is a separate operation so
-an incomplete run cannot become a release.
+## Checked-in pilot decisions
 
-## Install and authenticate
+The three-group v2 pilot pins:
 
-ImageMagick 7 must provide the `magick` command. Install the Python generation,
-Parquet, and Hub clients with:
+| Component | Repository | Immutable revision |
+|---|---|---|
+| Real source | `Spawning/PD12M` | `867988b01138799b89d3ffdd5b4f7e1455951f32` |
+| Captioner | `vikhyatk/moondream2` | `9a7d4024050840e001defacec2b00727e89149e6` |
+| Alignment QA | `openai/clip-vit-base-patch32` | `3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268` |
+
+PD12M is used because each selected row exposes a stable ID, source URL,
+dimensions, MIME type, and per-image public-domain/CC0 declaration. The
+dataset-level metadata license and the per-image artifact license are distinct:
+the builder accepts only rows whose `license` value normalizes to `CC0-1.0`.
+The byte source is the pinned row's `url`; it is preserved unchanged.
+
+PD12M contains artwork, scans, specimens, and other non-photographic material
+in addition to photographs. V2 applies three screens before assigning accepted
+source positions:
+
+1. metadata format, dimensions, license, and obvious non-photo term filters;
+2. corrupt/blank image checks;
+3. pinned CLIP photo-versus-non-photo and safety gates.
+
+The source dataset's existing caption is used only by the coarse metadata
+rejection screen. It is never used as the frozen caption or generation prompt.
+
+Moondream runs locally with `length="short"` and `temperature=0`. The exact raw
+caption and the normalized caption are both retained. `content-only-v1`
+removes presentation scaffolding, aesthetic judgments, hedging, and unsupported
+camera/style language while retaining visible subjects, actions, relationships,
+settings, and attributes.
+
+The CLIP thresholds in `specs/v2.json` are fixed pilot gates:
+
+- image–caption cosine similarity: at least `0.20`;
+- photographic-class probability: at least `0.55`;
+- unsafe-class probability: at most `0.35`.
+
+They make the pilot deterministic; they are not universal quality guarantees.
+Before a larger release, calibrate them on a labeled sample from every real
+source and generator family, record the calibration set and operating point,
+and version `threshold_policy`.
+
+## Install
+
+ImageMagick 7 must provide `magick`. Install all build dependencies with:
 
 ```bash
 ./install.sh
 ```
 
-The v1 generation matrix is entirely local: FLUX.1-schnell, Stable Diffusion
-XL 1.0, and Stable Diffusion 1.5 run through Diffusers. No image-generation API
-or paid provider is used. On first use, Hugging Face downloads model weights
-into its normal local cache. `hf auth login` may be needed to accept a model
-license, and the same login is used when publishing the finished dataset.
+The source, captioning, alignment, and generation extras can also be installed
+separately:
 
-Device selection is automatic: CUDA first, then Apple MPS, then CPU. CUDA uses
-model CPU offload by default to reduce VRAM pressure. Only one model family is
-kept loaded at a time. CPU generation is supported but can be very slow,
-especially for FLUX.
+```bash
+python3 -m pip install -e '.[source,captioning,alignment,generation,parquet]'
+```
 
-## Smoke test and real run
+The first non-dry build downloads the pinned Moondream, CLIP, FLUX, SDXL, and
+SD 1.5 weights through Hugging Face. Device choice is CUDA, then MPS, then CPU.
+CPU is supported but a complete build is slow.
 
-Start with a network- and generation-free dry run:
+## Dry run
+
+Dry run validates the complete contract and reports work without loading the HF
+dataset, downloading bytes or weights, running inference, or writing output:
 
 ```bash
 python3 -m mai.dataset_cli build \
-  --spec specs/v1.json \
-  --output .mai-data/package \
-  --cache .mai-data/cache \
-  --group-id animals-001 \
-  --group-id architecture-001 \
-  --group-id food-005 \
+  --spec specs/v2.json \
+  --output .mai-data/v2-package \
+  --cache .mai-data/v2-cache \
   --dry-run
 ```
 
-That selection covers three content categories and the complete planned axis:
-3 camera photographs plus 18 selected synthetic outputs, or 21 samples total.
-The default four-candidate review policy plans 72 synthetic generation jobs.
-Dry run validates the selection and reports cache hits, camera downloads,
-candidate jobs, and pending review decisions without accessing the network or
-writing files.
+The checked-in pilot reports:
 
-Run the same selection for real:
+- 3 source-photo groups;
+- 21 accepted-package slots if no group is quarantined;
+- 3 captions;
+- 36 generation candidates;
+- 42 QA calls, including source screens and caption alignment;
+- no manual review decisions.
 
-```bash
-python3 -m mai.dataset_cli build \
-  --spec specs/v1.json \
-  --output .mai-data/package \
-  --cache .mai-data/cache \
-  --group-id animals-001 \
-  --group-id architecture-001 \
-  --group-id food-005
-```
+The cache path is read only to report reusable work during dry run. A missing
+cache is not created.
 
-The first run finishes candidate generation and reports that review is
-required. Open `.mai-data/cache/review/candidates.json`; each entry maps a
-sample slot and candidate index to a cached PNG, seed, prompt, model revision,
-and checksum. Open `.mai-data/cache/review/index.html` for a visual candidate
-grid, then complete `.mai-data/cache/review/decisions.json`:
+## Build
 
-```json
-{
-  "status": "accepted",
-  "candidate_index": 2,
-  "candidate_sha256": "<copy candidate 2 sha256 from candidates.json>",
-  "rejected_candidates": {
-    "0": ["semantic_mismatch"],
-    "1": ["non_photographic_style"]
-  },
-  "reviewer": "reviewer-id",
-  "reviewed_at": "2026-07-29T18:00:00Z"
-}
-```
-
-Every candidate before the accepted candidate must have one or more declared
-rejection reasons. `candidate_sha256` binds the decision to the exact reviewed
-bytes, so changing a prompt, model, setting, or candidate invalidates a stale
-decision. Run the same Build command again; it validates the decisions and
-packages the selected candidates from cache. The TUI exposes the same Build
-arguments through `python3 -m mai`.
-
-For the 200-group preliminary run, omit `--group-id`:
+Run the pilot with:
 
 ```bash
 python3 -m mai.dataset_cli build \
-  --spec specs/v1.json \
-  --output .mai-data/package \
-  --cache .mai-data/cache
+  --spec specs/v2.json \
+  --output .mai-data/v2-package \
+  --cache .mai-data/v2-cache
 ```
 
-The full v1 matrix is 1,400 selected images: one camera image plus two outputs
-from each of three generator families for every group. Its four-candidate
-policy requires reviewing up to 4,800 generated candidates. Calibrate and
-freeze the prompt and generator settings on a small, non-evaluation subset
-before starting that run. An unfiltered build fails if the spec contains fewer
-than `dataset.target_group_count` groups.
+The builder processes source rows in the deterministic order produced by the
+pinned dataset, `sample_seed`, and streaming shuffle buffer. A group
+`source_index` means the Nth source row that passes license, metadata, image,
+photo/safety, exact-duplicate, and perceptual-near-duplicate gates. Processing
+all earlier positions makes a partial build select the same row as a full build.
 
-## Camera provenance and curation
+The split is stored on the planned group before captioning or generation.
+Exact SHA-256 and 64-bit difference hashes are checked before positions are
+assigned, so accepted duplicates cannot cross train, validation, and test.
+All descendants of one real photo inherit that group and split.
 
-The default Wikimedia adapter is an automated acquisition screen, not proof
-that an image has never been edited. It rejects missing camera EXIF, missing
-license data, non-JPEG files, images below 512 pixels on either side, and common
-editor names such as Photoshop or Lightroom in EXIF `Software`. The original
-file and all returned evidence remain available for audit.
+For each accepted real photo:
 
-Before treating a release as a strict camera-origin benchmark, visually review
-each selected photograph, its Commons source page, and its receipt. To lock a
-reviewed source, add a `camera_source` object to that group:
+1. Preserve the downloaded bytes and record SHA-256 and byte count.
+2. Cache the deterministic raw Moondream caption by source checksum and pinned
+   caption configuration.
+3. normalize the caption under `content-only-v1`;
+4. render and freeze the single prompt under `frozen-caption-v1`;
+5. score the real image against that normalized caption;
+6. generate two independently seeded candidates for every configured slot;
+7. apply the same image–caption score and the same photo/safety gates to every
+   candidate;
+8. select the first candidate by index that passes all gates.
 
-```json
-{
-  "camera_source": {
-    "adapter": "direct-url",
-    "url": "https://example.org/original.jpg",
-    "sha256": "64-lowercase-hex-characters",
-    "collection_id": "collection-name",
-    "source_record_id": "stable-record-id",
-    "landing_page_url": "https://example.org/record",
-    "license": {
-      "name": "CC BY 4.0",
-      "url": "https://creativecommons.org/licenses/by/4.0/"
-    },
-    "capture": {
-      "camera_make": "Canon",
-      "camera_model": "Canon EOS 5D Mark IV",
-      "captured_at": "2024-01-01T12:00:00Z"
-    }
-  }
-}
-```
+Candidate scores are never used to rank passing candidates. A later,
+higher-scoring candidate cannot replace an earlier passing candidate. This
+avoids aesthetic best-of-N selection.
 
-The direct adapter requires a JPEG, verifies its declared SHA-256 before use,
-and records the immutable URL and source metadata. For Wikimedia acquisition,
-`camera_source: {"query": "custom search terms"}` can override the query without
-changing adapters. `search_candidate_index` selects among the recorded
-license/EXIF-compatible results for exploratory builds; a release should use a
-pinned direct source because search rankings can change.
+## Quarantine and human audit
 
-Hybrid, image-to-image, edited, rephotographed, or otherwise ambiguous samples
-must not be marked `in_scope`. The initial validator accepts only
-`{"in_scope": true, "ambiguity_flags": []}`.
+Caption exceptions, real-image QA failures, generator exceptions, corrupt
+outputs, and all-candidate failures quarantine the complete source-photo group.
+No partial sibling group enters the package.
 
-## Build specification
-
-The root object has:
-
-| Field | Type | Meaning |
-|---|---|---|
-| `schema_version` | string | Must be `2.0.0`. |
-| `dataset` | object | Dataset-wide design and providers. |
-| `groups` | array | Preferred explicit semantic-group catalog. |
-| `samples` | array | Legacy manual flat samples; used instead of `groups`. |
-| `samples_file` | string | Legacy manual JSONL path; used instead of `groups`. |
-
-Build specifications remain schema `2.0.0`. The produced package contract is
-schema `3.0.0`; the validator and pull command also retain read compatibility
-with published schema-`2.0.0` ImageFolder packages.
-
-### Dataset fields
-
-| Field | Type | Meaning |
-|---|---|---|
-| `dataset_id` | ID | Stable lowercase dataset identity. |
-| `title` | string | Dataset-card title. |
-| `description` | string | Scope summary. |
-| `license` | string | Dataset policy; each sample also records its own license. |
-| `target_group_count` | integer | Required count for an unfiltered build. |
-| `seed_base` | integer | Base for deterministic per-group, per-slot seeds. |
-| `prompt_policy` | object | Versioned `{concept}` template shared by all generators. |
-| `generation_review` | object | Candidate count, allowed rejection reasons, and explicit-decision policy. |
-| `expected_slots` | array | Complete sample matrix required in every group. |
-| `camera_acquisition` | object | Default camera adapter and settings. |
-| `generators` | object | Generator-family configurations keyed by family ID. |
-| `normalization` | object | Optional normalization-profile overrides. |
-
-There must be exactly one `camera` slot and at least two synthetic generator
-families. Every synthetic slot has a unique `slot_id` and a
-`generator_family`. Repetitions are explicit slots, not a runtime “seeded
-groups” option.
-
-### Generator fields
-
-| Field | Type | Meaning |
-|---|---|---|
-| `family_id` | ID | Must equal the key in `dataset.generators`. |
-| `adapter` | ID | `local-diffusers`. |
-| `model_id` | string | Hugging Face model repository identifier. |
-| `model_revision` | string | Requested immutable revision; required by explicit review. |
-| `device` | string | `auto`, `cpu`, `mps`, `cuda`, or an explicit CUDA device. |
-| `cpu_offload` | boolean | Use Diffusers model CPU offload on CUDA; default `true`. |
-| `settings` | object | Resolution, inference steps, guidance, and optional negative prompt. |
-| `output_terms_url` | URL | Terms governing generated outputs. |
-
-Candidate zero receives the original deterministic 31-bit slot seed. Additional
-candidates derive independent seeds from `seed_base`, group ID, slot ID, and
-candidate index. The receipt records the selected candidate and rejected
-predecessors, resolved model commit, rendered prompt, prompt-template ID,
-Diffusers pipeline and scheduler configuration, runtime library versions,
-execution device, and Torch dtype.
-
-### Group fields
-
-| Field | Type | Meaning |
-|---|---|---|
-| `semantic_group_id` | ID | Stable group identity. |
-| `content_category` | string | Controlled content stratum. |
-| `split` | ID | Group-locked train, validation, or test split. |
-| `prompt` | object | Legacy frozen concept text and stable prompt ID. |
-| `concept` | object | Optional explicit concept; otherwise derived from `prompt`. |
-| `camera_source` | object | Optional query override or pinned direct source. |
-| `samples` | array | Optional legacy manual records; absent means on demand. |
-
-When `samples` is absent, Build creates every expected slot automatically.
-When it is present and nonempty, the group is treated as a fully manual group
-and must define its entire slot matrix.
-
-### Prepared sample fields
-
-The builder records these fields internally and in the package metadata:
-
-| Field | Meaning |
-|---|---|
-| `sample_id` | Unique group-plus-slot identity. |
-| `semantic_group_id` | Parent semantic group. |
-| `slot_id` / `origin_class` | Experimental slot and camera/synthetic class. |
-| `prompt` | Frozen prompt identifier and exact text. |
-| `input_path` | Internal cached input used for the local build. |
-| `source` | Collection, record ID, landing page, and license. |
-| `capture` | Camera make/model/time and automated edit-screen result. |
-| `generation` | Family, model, revision, provider, settings, and seed status. |
-| `scope` | In-scope decision and ambiguity flags. |
-| `provenance` | Acquisition or generation receipt. |
-| `audit` | Selection method, review information, and cache status. |
-
-IDs use lowercase letters, numbers, dots, underscores, and hyphens.
-
-## Local package and Hub release
-
-The ignored `.mai-data/` directory is the default local workspace:
+Quarantine receipts are written under:
 
 ```text
-.mai-data/
-├── cache/
-│   ├── assets/                    acquired/generated inputs
-│   └── receipts/                  checksummed cache receipts
-└── package/
-    ├── README.md                  Hugging Face dataset card
-    ├── dataset.json               release/model contract and spec checksum
-    ├── groups.json                compact group index
-    ├── validation_report.json     integrity/design audit
-    ├── data/<split>-<shard>.parquet
-    │                               typed rows and embedded normalized PNGs
-    ├── originals/<origin>/*       byte-identical originals
-    └── receipts/*.json            per-sample provenance evidence
+.mai-data/v2-cache/quarantine/<semantic-group-id>.json
 ```
 
-Parquet is the canonical analysis layer. Shards are capped near 256 MiB and
-never split a semantic group. `dataset.json` records every shard's path,
-checksum, byte count, and row count; `groups.json` maps each group to its shard
-so exact-group retrieval downloads only relevant data files. Normalized images
-use Hugging Face's typed `Image` feature with embedded PNG bytes. Originals and
-receipts remain individually addressable audit sidecars.
+They include the failed stage, reason, source lineage where available, candidate
+indices, seeds, scores, and exceptions. Receipts for the current build are
+copied to `package/quarantine/` and checksum-indexed in `dataset.json`.
 
-Stable provenance fields are typed nested columns. Each nested provenance
-object also carries canonical `details_json`, preserving adapter-specific or
-future fields without allowing smoke-run inference to change the Arrow schema.
+Human review is not required for every generated candidate. A deterministic 5%
+group sample is marked `human_audit_required`; its status starts as `pending`.
+All quarantined groups and any future manual override require review outside the
+automatic acceptance path. Manual audit metadata may be added without changing
+the frozen caption, source lineage, or automatic first-passing result.
 
-Validate and publish only after Build succeeds:
+## Required lineage
+
+The real-photo receipt retains:
+
+- HF dataset ID, exact revision, source split, row ID, and source URL;
+- declared and normalized artifact license;
+- byte-identical original SHA-256 and byte count;
+- dimensions, format, color channels, blank-image statistic, and perceptual
+  hash;
+- raw and normalized Moondream captions;
+- caption policy, model ID, exact revision, settings, runtime, and device;
+- QA model ID, exact revision, thresholds, runtime, and real-image scores;
+- source-photo group, split, and audit-sample status.
+
+Every synthetic receipt additionally retains:
+
+- the same source-photo and caption lineage;
+- generator family, model ID, exact revision, settings, runtime, scheduler, and
+  seed;
+- every candidate's index, checksum, byte count, health result, scores, and
+  failure reasons;
+- selected candidate index and `automatic-first-passing-v1`;
+- quarantine and manual-override status.
+
+The package validator fails missing or mismatched revisions, captions, source
+rows, source checksums, lineage, QA models, candidate arrays, or first-passing
+selection.
+
+## Package layout
+
+Accepted groups use the existing Parquet-native package contract:
+
+```text
+package/
+├── README.md
+├── dataset.json
+├── groups.json
+├── validation_report.json
+├── data/<split>-<shard>.parquet
+├── originals/
+│   ├── real_photo/real_photo/*
+│   └── synthetic/<generator-family>/*
+├── receipts/<sample-id>.json
+└── quarantine/<semantic-group-id>.json
+```
+
+Originals are copied byte-for-byte. All real and synthetic images then undergo
+the same deterministic 512×512 RGB normalization and metadata stripping before
+their normalized bytes are embedded in Parquet. A group is never split across
+Parquet shards.
+
+Validate independently with:
 
 ```bash
-python3 -m mai.dataset_cli validate --package .mai-data/package
+python3 -m mai.dataset_cli validate \
+  --package .mai-data/v2-package
+```
+
+Publish only after validation:
+
+```bash
 hf auth login
 python3 -m mai.dataset_cli publish \
-  --package .mai-data/package \
-  --repo-id OWNER/mai-pilot \
-  --tag v1
+  --package .mai-data/v2-package \
+  --repo-id OWNER/mai-v2-pilot \
+  --tag v2-pilot
 ```
 
-Record the returned commit SHA and pin it in experiments:
+Pin the returned Hub commit in every analysis.
 
-```python
-from datasets import load_dataset
+## Offline tests
 
-dataset = load_dataset("OWNER/mai-pilot", revision="COMMIT_SHA")
-```
+The tests replace HF streaming, Moondream, CLIP, and all generators with local
+deterministic adapters. They perform no network access and cover:
 
-To retrieve exact groups later:
+- immutable revision validation;
+- deterministic source selection and cache keys;
+- caption normalization;
+- exact and perceptual duplicate rejection;
+- identical real/generated semantic thresholds;
+- automatic first-passing selection;
+- exception and all-candidate quarantine;
+- source/caption lineage equality;
+- a complete three-group, 21-sample package build.
+
+Run:
 
 ```bash
-python3 -m mai.dataset_cli pull \
-  --repo-id OWNER/mai-pilot \
-  --revision COMMIT_SHA_OR_TAG \
-  --output .mai-data/selected \
-  --group-id animals-001
+python3 -m unittest discover -s tests
 ```
 
-## Validation guarantees
+## Research safeguards and limitations
 
-The builder and validator enforce:
-
-- a complete expected-slot matrix in every selected group;
-- one frozen prompt, category, and split per group;
-- camera evidence and text-to-image-only synthetic receipts;
-- explicit in-scope status with no ambiguity flags;
-- byte-identical originals with SHA-256 and byte counts;
-- deterministic embedded 512×512, 8-bit RGB PNG normalized images without
-  metadata;
-- explicit Parquet and Hugging Face feature schemas, shard checksums, byte
-  counts, and row counts;
-- unique original and normalized image content;
-- a group index equal to the unified metadata.
-
-These relationships support group-locked sampling, PCA/UMAP, distribution
-distances, linear probes, k-NN, cross-generator transfer, transformations, and
-stability analysis of a learned AI direction.
-
-## Complete CLI reference
-
-The TUI is the human entrypoint. `python3 -m mai.dataset_cli` is the automation
-surface.
-
-### `init`
-
-| Parameter | Meaning |
-|---|---|
-| `--spec PATH` | New empty build-spec path. |
-| `--force` | Replace an existing spec. |
-
-The checked-in `specs/v1.json` is already suitable for smoke and real runs;
-`init` is needed only for a genuinely different experiment design.
-
-### `build`
-
-| Parameter | Meaning |
-|---|---|
-| `--spec PATH` | Group catalog and model contract. |
-| `--output DIR` | Local Hugging Face package destination. |
-| `--cache DIR` | Reusable acquisition/generation cache; defaults to `cache` beside output. |
-| `--group-id ID` | Exact group to build; repeat for more. Omit for all groups. |
-| `--force` | Replace an existing recognized package, never the cache. |
-| `--dry-run` | Validate and report counts without network access or writes. |
-
-### `validate`
-
-| Parameter | Meaning |
-|---|---|
-| `--package DIR` | Local package containing `dataset.json`. |
-| `--report PATH` | Optional additional JSON report destination. |
-
-### `publish`
-
-| Parameter | Meaning |
-|---|---|
-| `--package DIR` | Validated local package. |
-| `--repo-id OWNER/NAME` | Hugging Face dataset repository. |
-| `--revision NAME` | Target branch; default `main`. |
-| `--tag NAME` | Optional immutable release tag after upload. |
-| `--private` | Create a private repository when new. |
-| `--commit-message TEXT` | Custom Hub commit message. |
-
-### `groups`
-
-| Parameter | Meaning |
-|---|---|
-| `--repo-id OWNER/NAME` | Hugging Face dataset repository. |
-| `--revision SHA_OR_TAG` | Pinned release revision. |
-| `--json` | Print full group index instead of a table. |
-
-### `pull`
-
-| Parameter | Meaning |
-|---|---|
-| `--repo-id OWNER/NAME` | Hugging Face dataset repository. |
-| `--revision SHA_OR_TAG` | Commit or release tag to retrieve. |
-| `--output DIR` | Verified local subset destination. |
-| `--group-id ID` | Exact group to retrieve; repeat for more. |
-| `--force` | Replace an existing recognized destination. |
+- Treat the source-photo group—not generated siblings—as the statistical unit.
+- Keep every sibling and transformed derivative in its source group's split.
+- Weight source groups and generator families equally in analysis.
+- Do not treat repeated candidates or sibling slots as independent samples.
+- Preserve byte-identical originals and apply one normalization implementation
+  to both origin classes.
+- Expand beyond PD12M before the full release; use several independent,
+  license-auditable real-photo sources.
+- Maintain a holdout with a different real source, a second caption policy or
+  human captions, and unseen generator families.
+- Run a small Moondream-versus-alternative-captioner ablation. Captioner errors
+  can create or suppress the apparent real/synthetic geometry.
+- Audit CLIP thresholds for demographic, cultural, geographic, and content
+  biases. CLIP scores are screening signals, not factual or safety proofs.
+- Do not revive the strict `camera` claim without defensible capture
+  provenance.

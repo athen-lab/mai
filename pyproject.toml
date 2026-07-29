@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mai-research"
-version = "0.3.0"
-description = "MAI camera-origin versus generated-image research workbench"
+version = "0.4.0"
+description = "MAI real-photo versus generated-image research workbench"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 
@@ -13,6 +13,24 @@ license = "Apache-2.0"
 hub = ["huggingface-hub>=0.34,<2"]
 parquet = ["datasets[vision]>=4,<5", "pyarrow>=18"]
 analysis = ["datasets[vision]>=4,<5", "pyarrow>=18"]
+source = [
+    "datasets[vision]>=4,<5",
+    "huggingface-hub>=0.34,<2",
+    "Pillow>=11,<13",
+]
+captioning = [
+    "accelerate>=0.31,<2",
+    "huggingface-hub>=0.34,<2",
+    "Pillow>=11,<13",
+    "torch>=2.1,<3",
+    "transformers>=4.41,<6",
+]
+alignment = [
+    "huggingface-hub>=0.34,<2",
+    "Pillow>=11,<13",
+    "torch>=2.1,<3",
+    "transformers>=4.41,<6",
+]
 generation = [
     "accelerate>=0.31,<2",
     "diffusers>=0.30,<1",

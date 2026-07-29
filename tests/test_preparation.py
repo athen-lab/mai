@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import binascii
 from copy import deepcopy
+import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import struct
 import sys
 import tempfile
@@ -16,6 +18,7 @@ import zlib
 from mai.dataset import PipelineError, build_package
 from mai.preparation import (
     _camera_search_queries,
+    normalize_caption,
     preparation_plan,
     prepare_groups,
     run_local_diffusers,
@@ -44,6 +47,31 @@ def make_png(path: Path, color: tuple[int, int, int]) -> None:
             struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0),
         )
         + png_chunk(b"IDAT", zlib.compress(row * height))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def make_pattern_png(path: Path, seed: int, size: int = 16) -> None:
+    rows = []
+    for y in range(size):
+        pixels = bytearray()
+        for x in range(size):
+            pixels.extend(
+                (
+                    (x * seed + y * 3) % 256,
+                    (y * seed + x * 5) % 256,
+                    ((x + y) * seed + x * y) % 256,
+                )
+            )
+        rows.append(b"\x00" + bytes(pixels))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(
+            b"IHDR",
+            struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0),
+        )
+        + png_chunk(b"IDAT", zlib.compress(b"".join(rows)))
         + png_chunk(b"IEND", b"")
     )
 
@@ -598,6 +626,343 @@ class PreparationTests(unittest.TestCase):
             report["preparation"]["review_decisions_pending"],
             18,
         )
+
+    def _v2_fixture(
+        self,
+    ) -> tuple[
+        Path,
+        dict[str, object],
+        list[dict[str, object]],
+        dict[str, object],
+    ]:
+        repository = Path(__file__).resolve().parents[1]
+        spec = json.loads(
+            (repository / "specs/v2.json").read_text(encoding="utf-8")
+        )
+        spec["dataset"]["real_source"].update(
+            {
+                "image_column": "image",
+                "oversample_factor": 2,
+                "metadata_filter_columns": [],
+                "metadata_reject_patterns": [],
+            }
+        )
+        spec["dataset"]["automated_qa"].update(
+            {
+                "minimum_dimension": 16,
+                "blank_stddev_min": 0.1,
+                "near_duplicate_hamming_distance": 0,
+                "photo_probability_min": 0.5,
+                "unsafe_probability_max": 0.5,
+            }
+        )
+        spec_path = self.root / "v2.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        source_rows: list[dict[str, object]] = []
+        source_digests: set[str] = set()
+        for index, seed in enumerate((7, 13, 29), 1):
+            image = self.root / "source" / f"{index}.png"
+            make_pattern_png(image, seed)
+            import hashlib
+
+            source_digests.add(hashlib.sha256(image.read_bytes()).hexdigest())
+            source_rows.append(
+                {
+                    "id": f"source-{index}",
+                    "image": str(image),
+                    "url": f"https://example.test/source-{index}",
+                    "license": (
+                        "https://creativecommons.org/publicdomain/zero/1.0/"
+                    ),
+                    "source": "Test archive",
+                    "width": 16,
+                    "height": 16,
+                    "mime_type": "image/png",
+                }
+            )
+        state: dict[str, object] = {
+            "source_rows": source_rows,
+            "source_digests": source_digests,
+            "generator_pass": {},
+            "calls": {
+                "source": 0,
+                "caption": 0,
+                "qa": 0,
+                "generator": 0,
+            },
+        }
+        return spec_path, spec, spec["groups"], state
+
+    def _v2_adapters(
+        self,
+        state: dict[str, object],
+        *,
+        pass_generated: bool = True,
+    ) -> tuple[object, object, object, object]:
+        import hashlib
+
+        calls = state["calls"]
+
+        def source_loader(
+            config: dict[str, object],
+            limit: int,
+        ) -> list[dict[str, object]]:
+            calls["source"] += 1
+            return deepcopy(state["source_rows"])[:limit]
+
+        def caption(
+            path: Path,
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            calls["caption"] += 1
+            return {
+                "raw_caption": (
+                    "This image shows a beautiful red cup on a wooden table."
+                ),
+                "runtime": {"mock-captioner": "1"},
+            }
+
+        def generator(
+            group: dict[str, object],
+            config: dict[str, object],
+            seed: int | None,
+            target: Path,
+        ) -> dict[str, object]:
+            calls["generator"] += 1
+            call_number = calls["generator"]
+            make_pattern_png(target, 40 + call_number)
+            digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            state["generator_pass"][digest] = (
+                pass_generated and call_number % 2 == 0
+            )
+            return {
+                "capture": None,
+                "generation": {
+                    "family_id": config["family_id"],
+                    "model_id": config["model_id"],
+                    "model_revision": config["model_revision"],
+                    "provider": "mock-generator",
+                    "settings": deepcopy(config["settings"]),
+                    "input_image_used": False,
+                    "seed_status": "recorded",
+                    "seed": seed,
+                },
+                "scope": {
+                    "in_scope": False,
+                    "ambiguity_flags": ["pending-qa"],
+                },
+                "audit": {},
+                "provenance": {
+                    "kind": "mock-generation",
+                    "runtime": {"mock-generator": "1"},
+                },
+            }
+
+        def qa(
+            path: Path,
+            caption_text: str | None,
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            calls["qa"] += 1
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            source = digest in state["source_digests"]
+            passed = source or bool(state["generator_pass"].get(digest))
+            return {
+                "alignment_score": 0.8 if passed else 0.1,
+                "photo_probability": 0.9,
+                "unsafe_probability": 0.01,
+                "runtime": {"mock-qa": "1"},
+            }
+
+        return source_loader, caption, qa, generator
+
+    def test_caption_normalization_is_content_only(self) -> None:
+        self.assertEqual(
+            normalize_caption(
+                "This image shows a stunning red cup, likely on a table."
+            ),
+            "A red cup, on a table.",
+        )
+
+    def test_v2_offline_adapters_are_deterministic_and_first_passing(
+        self,
+    ) -> None:
+        _, spec, groups, state = self._v2_fixture()
+        source_loader, caption, qa, generator = self._v2_adapters(state)
+        cache = self.root / "cache"
+        first, first_plan = prepare_groups(
+            spec,
+            groups,
+            cache,
+            source_loaders={"huggingface-dataset": source_loader},
+            caption_runners={"moondream-local": caption},
+            qa_runners={"clip-local": qa},
+            generator_runners={"local-diffusers": generator},
+        )
+        calls_after_first = deepcopy(state["calls"])
+        second, second_plan = prepare_groups(
+            spec,
+            groups,
+            cache,
+            source_loaders={"huggingface-dataset": source_loader},
+            caption_runners={"moondream-local": caption},
+            qa_runners={"clip-local": qa},
+            generator_runners={"local-diffusers": generator},
+        )
+        self.assertEqual(len(first), 21)
+        self.assertEqual(len(second), 21)
+        self.assertEqual(first_plan["quarantined_group_count"], 0)
+        self.assertEqual(second_plan["quarantined_group_count"], 0)
+        self.assertEqual(state["calls"]["caption"], calls_after_first["caption"])
+        self.assertEqual(
+            state["calls"]["generator"],
+            calls_after_first["generator"],
+        )
+        self.assertEqual(state["calls"]["qa"], calls_after_first["qa"])
+        synthetic = [
+            sample
+            for sample in first
+            if sample["origin_class"] == "synthetic"
+        ]
+        self.assertTrue(
+            all(
+                sample["generation"]["candidate_index"] == 1
+                for sample in synthetic
+            )
+        )
+        by_group = {
+            sample["semantic_group_id"]: sample
+            for sample in first
+            if sample["origin_class"] == "real_photo"
+        }
+        for sample in synthetic:
+            source = by_group[sample["semantic_group_id"]]
+            self.assertEqual(
+                sample["provenance"]["lineage"],
+                source["provenance"]["lineage"],
+            )
+            self.assertEqual(
+                sample["provenance"]["captioning"],
+                source["provenance"]["captioning"],
+            )
+
+    def test_v2_failed_candidates_quarantine_groups(self) -> None:
+        _, spec, groups, state = self._v2_fixture()
+        source_loader, caption, qa, generator = self._v2_adapters(
+            state,
+            pass_generated=False,
+        )
+        samples, plan = prepare_groups(
+            spec,
+            groups,
+            self.root / "quarantine-cache",
+            source_loaders={"huggingface-dataset": source_loader},
+            caption_runners={"moondream-local": caption},
+            qa_runners={"clip-local": qa},
+            generator_runners={"local-diffusers": generator},
+        )
+        self.assertEqual(samples, [])
+        self.assertEqual(plan["accepted_group_count"], 0)
+        self.assertEqual(plan["quarantined_group_count"], 3)
+        for value in plan["quarantine_files"]:
+            receipt = json.loads(Path(value).read_text(encoding="utf-8"))
+            self.assertEqual(receipt["status"], "quarantined")
+            self.assertEqual(
+                receipt["reason"],
+                "all_generated_candidates_failed",
+            )
+
+    def test_v2_rejects_duplicate_sources_before_split_assignment(self) -> None:
+        _, spec, groups, state = self._v2_fixture()
+        state["source_rows"][1]["image"] = state["source_rows"][0]["image"]
+        source_loader, caption, qa, generator = self._v2_adapters(state)
+        with self.assertRaisesRegex(PipelineError, "valid unique photos"):
+            prepare_groups(
+                spec,
+                groups,
+                self.root / "duplicate-cache",
+                source_loaders={"huggingface-dataset": source_loader},
+                caption_runners={"moondream-local": caption},
+                qa_runners={"clip-local": qa},
+                generator_runners={"local-diffusers": generator},
+            )
+
+    def test_checked_in_v2_dry_run_is_network_free(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        report = build_package(
+            repository / "specs/v2.json",
+            self.root / "v2-package",
+            dry_run=True,
+        )
+        self.assertEqual(report["group_count"], 3)
+        self.assertEqual(report["sample_count"], 21)
+        self.assertEqual(report["preparation"]["camera_downloads"], 0)
+        self.assertEqual(report["preparation"]["caption_jobs"], 3)
+        self.assertEqual(report["preparation"]["generation_jobs"], 36)
+        self.assertEqual(report["preparation"]["qa_jobs"], 42)
+        self.assertFalse((self.root / "v2-package").exists())
+
+    def test_v2_requires_immutable_source_caption_and_qa_revisions(
+        self,
+    ) -> None:
+        _, spec, groups, _ = self._v2_fixture()
+        locations = (
+            ("real_source", "revision"),
+            ("captioning", "model_revision"),
+            ("automated_qa", "model_revision"),
+        )
+        for section, field in locations:
+            broken = deepcopy(spec)
+            broken["dataset"][section][field] = "main"
+            with self.subTest(section=section), self.assertRaisesRegex(
+                PipelineError,
+                "40-character lowercase commit SHA",
+            ):
+                preparation_plan(broken, groups)
+        broken = deepcopy(spec)
+        broken["dataset"]["real_source"]["license_policy"]["allowed"] = []
+        with self.assertRaisesRegex(
+            PipelineError,
+            "license_policy.allowed",
+        ):
+            preparation_plan(broken, groups)
+
+    @unittest.skipUnless(
+        shutil.which("magick")
+        and importlib.util.find_spec("datasets") is not None,
+        "ImageMagick and Parquet dependencies are required",
+    )
+    def test_v2_three_group_offline_smoke_package(self) -> None:
+        spec_path, _, _, state = self._v2_fixture()
+        source_loader, caption, qa, generator = self._v2_adapters(state)
+        package = self.root / "v2-package"
+        with (
+            patch(
+                "mai.preparation.load_huggingface_rows",
+                source_loader,
+            ),
+            patch("mai.preparation.run_moondream_caption", caption),
+            patch("mai.preparation.run_clip_qa", qa),
+            patch("mai.preparation.run_local_diffusers", generator),
+        ):
+            report = build_package(
+                spec_path,
+                package,
+                cache_dir=self.root / "v2-package-cache",
+            )
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["group_count"], 3)
+        self.assertEqual(report["sample_count"], 21)
+        contract = json.loads(
+            (package / "dataset.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            contract["design"]["real_source"]["revision"],
+            "867988b01138799b89d3ffdd5b4f7e1455951f32",
+        )
+        self.assertEqual(contract["files"]["quarantine"], [])
+        receipts = list((package / "receipts").glob("*.json"))
+        self.assertEqual(len(receipts), 21)
 
 
 if __name__ == "__main__":
