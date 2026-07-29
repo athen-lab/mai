@@ -7,10 +7,13 @@ import gc
 import hashlib
 from html import escape
 from importlib.metadata import PackageNotFoundError, version
+from itertools import islice
 import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -26,7 +29,7 @@ from .dataset import (
 )
 
 
-USER_AGENT = "mai-research/0.3 (+https://github.com/kenneth/mai)"
+USER_AGENT = "mai-research/0.4 (+https://github.com/athen-lab/mai)"
 MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 JPEG_SIGNATURE = b"\xff\xd8\xff"
 REJECTED_EDITORS = (
@@ -104,6 +107,50 @@ GeneratorRunner = Callable[
     [dict[str, Any], dict[str, Any], int | None, Path],
     dict[str, Any],
 ]
+RealSourceLoader = Callable[
+    [dict[str, Any], int],
+    list[dict[str, Any]],
+]
+CaptionRunner = Callable[
+    [Path, dict[str, Any]],
+    dict[str, Any] | str,
+]
+QARunner = Callable[
+    [Path, str | None, dict[str, Any]],
+    dict[str, Any],
+]
+
+LICENSE_ALIASES = {
+    "cc-by-4.0": "CC-BY-4.0",
+    "cc by 4.0": "CC-BY-4.0",
+    "https://creativecommons.org/licenses/by/4.0/": "CC-BY-4.0",
+    "cc0-1.0": "CC0-1.0",
+    "cc0 1.0": "CC0-1.0",
+    "https://creativecommons.org/publicdomain/zero/1.0/": "CC0-1.0",
+}
+LICENSE_URLS = {
+    "CC-BY-4.0": "https://creativecommons.org/licenses/by/4.0/",
+    "CC0-1.0": "https://creativecommons.org/publicdomain/zero/1.0/",
+}
+CAPTION_SCAFFOLDING = (
+    r"^\s*(?:this|the)\s+(?:image|photo|photograph|picture)\s+"
+    r"(?:shows|depicts|features|captures|contains|is\s+of)\s+",
+    r"^\s*in\s+(?:this|the)\s+(?:image|photo|photograph|picture)\s*,?\s*",
+    r"^\s*(?:we|you)\s+can\s+see\s+",
+)
+CAPTION_AESTHETIC_WORDS = {
+    "beautiful",
+    "breathtaking",
+    "captivating",
+    "charming",
+    "gorgeous",
+    "lovely",
+    "picturesque",
+    "stunning",
+}
+
+_CAPTION_MODEL: dict[str, Any] = {}
+_CLIP_MODEL: dict[str, Any] = {}
 
 
 def _package_version(name: str) -> str | None:
@@ -111,6 +158,422 @@ def _package_version(name: str) -> str | None:
         return version(name)
     except PackageNotFoundError:
         return None
+
+
+def normalize_caption(raw_caption: str, policy: str = "content-only-v1") -> str:
+    """Normalize a model caption into a factual, generator-facing description."""
+    if policy != "content-only-v1":
+        raise PipelineError(f"unknown caption normalization policy: {policy}")
+    if not isinstance(raw_caption, str) or not raw_caption.strip():
+        raise PipelineError("captioner returned an empty caption")
+    text = " ".join(raw_caption.replace("\n", " ").split()).strip(" \"'")
+    for pattern in CAPTION_SCAFFOLDING:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b(?:likely|probably|possibly|apparently)\b\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(?:appears|seems)\s+to\s+(?:show|depict|be)\b\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(?:professionally\s+shot|high[- ]resolution|wide[- ]angle|"
+        r"telephoto|cinematic|award[- ]winning)\b\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    aesthetic = "|".join(sorted(CAPTION_AESTHETIC_WORDS))
+    text = re.sub(
+        rf"\b(?:{aesthetic})\b[\s,]*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    text = re.sub(r",\s*,+", ", ", text)
+    text = re.sub(r"\s{2,}", " ", text).strip(" ,.;:-")
+    if not text:
+        raise PipelineError(
+            "caption normalization removed all factual content"
+        )
+    return text[0].upper() + text[1:] + "."
+
+
+def _render_caption_prompt(
+    group_id: str,
+    normalized_caption: str,
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    template = str(policy["template"])
+    caption = normalized_caption.rstrip(".")
+    try:
+        text = template.format(caption=caption).strip()
+    except (KeyError, ValueError) as error:
+        raise PipelineError(f"invalid caption prompt template: {error}") from error
+    if not text:
+        raise PipelineError("caption prompt template rendered an empty prompt")
+    return {
+        "prompt_id": f"caption-{group_id}",
+        "text": text,
+        "frozen": True,
+    }
+
+
+def _canonical_license(
+    raw_value: Any,
+    policy: dict[str, Any],
+) -> tuple[str, str] | None:
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return None
+    aliases = {
+        **LICENSE_ALIASES,
+        **{
+            str(key).casefold(): str(value)
+            for key, value in policy.get("aliases", {}).items()
+        },
+    }
+    raw = raw_value.strip()
+    canonical = aliases.get(raw.casefold(), raw)
+    allowed = policy.get("allowed", [])
+    if canonical not in allowed:
+        return None
+    return canonical, LICENSE_URLS.get(canonical, raw)
+
+
+def load_huggingface_rows(
+    config: dict[str, Any],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Load a deterministic, bounded row stream from a pinned HF revision."""
+    try:
+        from datasets import load_dataset
+    except ImportError as error:
+        raise PipelineError(
+            "Hugging Face source dependencies are missing; install with "
+            "`python3 -m pip install -e '.[source]'`"
+        ) from error
+    try:
+        rows = load_dataset(
+            config["dataset_id"],
+            revision=config["revision"],
+            split=config["split"],
+            streaming=True,
+        )
+        rows = rows.shuffle(
+            seed=int(config["sample_seed"]),
+            buffer_size=int(config.get("shuffle_buffer_size", 10_000)),
+        )
+        return [dict(row) for row in islice(rows, limit)]
+    except Exception as error:
+        raise PipelineError(
+            f"cannot stream {config['dataset_id']}@{config['revision']}: "
+            f"{error}"
+        ) from error
+
+
+def _materialize_hf_image(value: Any, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(value, str):
+        if value.startswith(("https://", "http://")):
+            _download(value, target)
+            return
+        source = Path(value).expanduser().resolve()
+        if not source.is_file():
+            raise PipelineError(f"HF image path does not exist: {source}")
+        shutil.copyfile(source, target)
+        return
+    if isinstance(value, dict):
+        payload = value.get("bytes")
+        if isinstance(payload, bytes):
+            target.write_bytes(payload)
+            return
+        path = value.get("path")
+        if isinstance(path, str):
+            _materialize_hf_image(path, target)
+            return
+    if hasattr(value, "save"):
+        image_format = getattr(value, "format", None) or "PNG"
+        value.save(target, format=image_format)
+        return
+    raise PipelineError(
+        f"unsupported HF image value: {type(value).__name__}"
+    )
+
+
+def _image_health(path: Path, config: dict[str, Any]) -> dict[str, Any]:
+    if shutil.which("magick") is None:
+        raise PipelineError("ImageMagick 7 (`magick`) is required")
+    identify = subprocess.run(
+        [
+            "magick",
+            "identify",
+            "-format",
+            "%w\t%h\t%m\t%[channels]",
+            str(path),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if identify.returncode:
+        raise PipelineError(
+            f"corrupt image: {identify.stderr.strip() or identify.stdout.strip()}"
+        )
+    parts = identify.stdout.split("\t")
+    if len(parts) != 4:
+        raise PipelineError("unexpected ImageMagick image-health output")
+    try:
+        width, height = int(parts[0]), int(parts[1])
+    except ValueError as error:
+        raise PipelineError("invalid image dimensions") from error
+    source_format, source_mode = parts[2], parts[3]
+    pixels_result = subprocess.run(
+        [
+            "magick",
+            str(path),
+            "-colorspace",
+            "gray",
+            "-resize",
+            "9x8!",
+            "-depth",
+            "8",
+            "gray:-",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if pixels_result.returncode or len(pixels_result.stdout) != 72:
+        raise PipelineError(
+            "cannot derive image-health pixels: "
+            + pixels_result.stderr.decode("utf-8", errors="replace").strip()
+        )
+    pixels = list(pixels_result.stdout)
+    mean = sum(pixels) / len(pixels)
+    stddev = (
+        sum((value - mean) ** 2 for value in pixels) / len(pixels)
+    ) ** 0.5
+    minimum = int(config.get("minimum_dimension", 512))
+    if min(width, height) < minimum:
+        raise PipelineError(
+            f"image dimensions {width}x{height} are below {minimum}"
+        )
+    if not source_mode or source_mode.casefold() in {"undefined", "unknown"}:
+        raise PipelineError(f"unsupported image color mode: {source_mode}")
+    blank_min = float(config.get("blank_stddev_min", 2.0))
+    if stddev < blank_min:
+        raise PipelineError(
+            f"blank-image standard deviation {stddev:.4f} is below {blank_min}"
+        )
+    bits = 0
+    for row in range(8):
+        for column in range(8):
+            left = pixels[row * 9 + column]
+            right = pixels[row * 9 + column + 1]
+            bits = (bits << 1) | int(left > right)
+    return {
+        "width": width,
+        "height": height,
+        "mode": source_mode,
+        "format": source_format,
+        "grayscale_stddev": stddev,
+        "perceptual_hash": f"{bits:016x}",
+    }
+
+
+def _hamming_distance(left: str, right: str) -> int:
+    return (int(left, 16) ^ int(right, 16)).bit_count()
+
+
+def run_moondream_caption(
+    path: Path,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        import torch
+        from PIL import Image
+        from transformers import AutoModelForCausalLM
+    except ImportError as error:
+        raise PipelineError(
+            "Moondream dependencies are missing; install with "
+            "`python3 -m pip install -e '.[captioning]'`"
+        ) from error
+    device = _local_device(torch, str(config.get("device", "auto")))
+    key = _json_key(
+        {
+            "model_id": config["model_id"],
+            "model_revision": config["model_revision"],
+            "device": device,
+        }
+    )
+    if _CAPTION_MODEL.get("key") != key:
+        _CAPTION_MODEL.clear()
+        dtype = torch.float32 if device == "cpu" else torch.float16
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                config["model_id"],
+                revision=config["model_revision"],
+                trust_remote_code=True,
+                torch_dtype=dtype,
+                device_map={"": device},
+            )
+            model.eval()
+        except Exception as error:
+            raise PipelineError(
+                f"cannot load Moondream captioner: {error}"
+            ) from error
+        _CAPTION_MODEL.update({"key": key, "model": model, "device": device})
+    with Image.open(path) as opened:
+        image = opened.convert("RGB")
+        try:
+            torch.manual_seed(0)
+            result = _CAPTION_MODEL["model"].caption(
+                image,
+                length=config["length"],
+            )
+        except Exception as error:
+            raise PipelineError(f"Moondream captioning failed: {error}") from error
+    raw = result.get("caption") if isinstance(result, dict) else result
+    if not isinstance(raw, str) or not raw.strip():
+        raise PipelineError("Moondream returned no caption")
+    return {
+        "raw_caption": raw.strip(),
+        "runtime": {
+            "torch": getattr(torch, "__version__", None),
+            "transformers": _package_version("transformers"),
+        },
+        "device": device,
+    }
+
+
+def run_clip_qa(
+    path: Path,
+    caption: str | None,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        import torch
+        from PIL import Image
+        from transformers import CLIPModel, CLIPProcessor
+    except ImportError as error:
+        raise PipelineError(
+            "alignment dependencies are missing; install with "
+            "`python3 -m pip install -e '.[alignment]'`"
+        ) from error
+    device = _local_device(torch, str(config.get("device", "auto")))
+    key = _json_key(
+        {
+            "model_id": config["model_id"],
+            "model_revision": config["model_revision"],
+            "device": device,
+        }
+    )
+    if _CLIP_MODEL.get("key") != key:
+        _CLIP_MODEL.clear()
+        try:
+            model = CLIPModel.from_pretrained(
+                config["model_id"],
+                revision=config["model_revision"],
+            ).to(device)
+            model.eval()
+            processor = CLIPProcessor.from_pretrained(
+                config["model_id"],
+                revision=config["model_revision"],
+            )
+        except Exception as error:
+            raise PipelineError(f"cannot load CLIP QA model: {error}") from error
+        _CLIP_MODEL.update(
+            {"key": key, "model": model, "processor": processor}
+        )
+    labels = [
+        "a photograph of a real scene or object",
+        "a painting, drawing, illustration, diagram, screenshot, or scanned page",
+        "safe ordinary visual content",
+        "graphic sexual, violent, hateful, or otherwise unsafe visual content",
+    ]
+    texts = ([caption] if caption is not None else []) + labels
+    with Image.open(path) as opened:
+        image = opened.convert("RGB")
+        processor = _CLIP_MODEL["processor"]
+        model = _CLIP_MODEL["model"]
+        inputs = processor(
+            text=texts,
+            images=image,
+            return_tensors="pt",
+            padding=True,
+        )
+        inputs = {
+            name: value.to(device) if hasattr(value, "to") else value
+            for name, value in inputs.items()
+        }
+        try:
+            with torch.inference_mode():
+                image_features = model.get_image_features(
+                    pixel_values=inputs["pixel_values"]
+                )
+                text_features = model.get_text_features(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask"),
+                )
+                image_features = image_features / image_features.norm(
+                    dim=-1,
+                    keepdim=True,
+                )
+                text_features = text_features / text_features.norm(
+                    dim=-1,
+                    keepdim=True,
+                )
+                similarities = (
+                    image_features @ text_features.T
+                )[0].detach().cpu()
+        except Exception as error:
+            raise PipelineError(f"CLIP QA inference failed: {error}") from error
+    offset = 1 if caption is not None else 0
+    photo_probability = torch.softmax(
+        similarities[offset:offset + 2] * 100.0,
+        dim=0,
+    )[0].item()
+    unsafe_probability = torch.softmax(
+        similarities[offset + 2:offset + 4] * 100.0,
+        dim=0,
+    )[1].item()
+    return {
+        "alignment_score": (
+            float(similarities[0].item()) if caption is not None else None
+        ),
+        "photo_probability": float(photo_probability),
+        "unsafe_probability": float(unsafe_probability),
+        "runtime": {
+            "torch": getattr(torch, "__version__", None),
+            "transformers": _package_version("transformers"),
+        },
+        "device": device,
+    }
+
+
+def _cached_json_result(
+    cache_dir: Path,
+    namespace: str,
+    key: str,
+    producer: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    path = cache_dir / namespace / f"{key}.json"
+    if path.is_file():
+        value = read_json(path)
+        value["_cache_hit"] = True
+        return value
+    value = producer()
+    if not isinstance(value, dict):
+        raise PipelineError(f"{namespace} adapter returned a non-object")
+    write_json(path, value)
+    result = deepcopy(value)
+    result["_cache_hit"] = False
+    return result
 
 
 def _concept_text(group: dict[str, Any]) -> str:
@@ -1047,12 +1510,435 @@ def _cache_entry_valid(
         return False
 
 
+def _real_photo_plan(
+    spec: dict[str, Any],
+    groups: list[dict[str, Any]],
+) -> dict[str, Any]:
+    dataset = spec["dataset"]
+    expected_slots = dataset["expected_slots"]
+    synthetic_slots = [
+        slot
+        for slot in expected_slots
+        if slot["origin_class"] == "synthetic"
+    ]
+    selection = dataset["generation_selection"]
+    candidates = selection["candidates_per_slot"]
+    highest_source_index = max(
+        (int(group["source_index"]) for group in groups),
+        default=-1,
+    )
+    source = dataset["real_source"]
+    oversample_factor = int(source.get("oversample_factor", 20))
+    return {
+        "pipeline": "hf-real-photo-caption-v2",
+        "group_count": len(groups),
+        "sample_count": len(groups) * len(expected_slots),
+        "cache_hits": 0,
+        "camera_downloads": 0,
+        "source_rows_requested": (
+            (highest_source_index + 1) * oversample_factor
+        ),
+        "caption_jobs": len(groups),
+        "generation_jobs": len(groups) * len(synthetic_slots) * candidates,
+        "generation_candidate_count": (
+            len(groups) * len(synthetic_slots) * candidates
+        ),
+        "generation_candidates_per_slot": candidates,
+        "qa_jobs": (
+            2 * len(groups)
+            + len(groups) * len(synthetic_slots) * candidates
+        ),
+        "review_decisions_pending": 0,
+        "configured_credentials": [],
+        "required_credentials": [],
+        "missing_credentials": [],
+        "accepted_group_count": len(groups),
+        "quarantined_group_count": 0,
+        "quarantine_files": [],
+    }
+
+
+def _source_rejection(
+    cache_dir: Path,
+    source_id: str,
+    reason: str,
+    details: dict[str, Any],
+) -> None:
+    key = _json_key({"source_id": source_id, "reason": reason, **details})
+    write_json(
+        cache_dir / "source-rejections" / f"{key}.json",
+        {
+            "schema_version": "1.0.0",
+            "status": "rejected-before-split",
+            "source_record_id": source_id,
+            "reason": reason,
+            "details": details,
+        },
+    )
+
+
+def _qa_failures(
+    qa: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    require_alignment: bool,
+) -> list[str]:
+    failures: list[str] = []
+    if require_alignment:
+        score = qa.get("alignment_score")
+        threshold = float(config["alignment_threshold"])
+        if not isinstance(score, (int, float)) or float(score) < threshold:
+            failures.append("semantic_alignment")
+    photo_min = float(config.get("photo_probability_min", 0.0))
+    photo_score = qa.get("photo_probability")
+    if (
+        photo_min > 0
+        and (
+            not isinstance(photo_score, (int, float))
+            or float(photo_score) < photo_min
+        )
+    ):
+        failures.append("non_photographic_style")
+    unsafe_max = float(config.get("unsafe_probability_max", 1.0))
+    unsafe_score = qa.get("unsafe_probability")
+    if (
+        unsafe_max < 1
+        and (
+            not isinstance(unsafe_score, (int, float))
+            or float(unsafe_score) > unsafe_max
+        )
+    ):
+        failures.append("unsafe_content")
+    return failures
+
+
+def _select_hf_sources(
+    dataset: dict[str, Any],
+    groups: list[dict[str, Any]],
+    cache_dir: Path,
+    source_loader: RealSourceLoader,
+    qa_runner: QARunner,
+) -> dict[int, dict[str, Any]]:
+    config = dataset["real_source"]
+    qa_config = dataset["automated_qa"]
+    highest_index = max(int(group["source_index"]) for group in groups)
+    needed = highest_index + 1
+    limit = needed * int(config.get("oversample_factor", 20))
+    rows = source_loader(config, limit)
+    if not isinstance(rows, list):
+        rows = list(rows)
+    selected: list[dict[str, Any]] = []
+    exact_digests: dict[str, str] = {}
+    perceptual_hashes: list[tuple[str, str]] = []
+    image_column = str(config["image_column"])
+    id_column = str(config["id_column"])
+    license_column = str(config["license_column"])
+    source_url_column = str(config["source_url_column"])
+    allowed_mime = set(config.get("allowed_mime_types", []))
+    metadata_columns = config.get("metadata_filter_columns", [])
+    reject_patterns = [
+        re.compile(pattern, flags=re.IGNORECASE)
+        for pattern in config.get("metadata_reject_patterns", [])
+    ]
+    for rank, row in enumerate(rows):
+        if len(selected) >= needed:
+            break
+        if not isinstance(row, dict):
+            continue
+        source_id = row.get(id_column)
+        if source_id in (None, ""):
+            _source_rejection(
+                cache_dir,
+                f"row-{rank}",
+                "missing_stable_id",
+                {"rank": rank},
+            )
+            continue
+        source_id = str(source_id)
+        canonical_license = _canonical_license(
+            row.get(license_column),
+            config["license_policy"],
+        )
+        if canonical_license is None:
+            _source_rejection(
+                cache_dir,
+                source_id,
+                "license_not_allowed",
+                {"license": row.get(license_column)},
+            )
+            continue
+        source_url = row.get(source_url_column)
+        if not isinstance(source_url, str) or not source_url:
+            _source_rejection(
+                cache_dir,
+                source_id,
+                "missing_source_url",
+                {},
+            )
+            continue
+        mime_column = config.get("mime_type_column")
+        mime_type = row.get(mime_column) if isinstance(mime_column, str) else None
+        if allowed_mime and mime_type not in allowed_mime:
+            _source_rejection(
+                cache_dir,
+                source_id,
+                "invalid_mime_type",
+                {"mime_type": mime_type},
+            )
+            continue
+        width_column = config.get("width_column")
+        height_column = config.get("height_column")
+        declared_width = (
+            row.get(width_column) if isinstance(width_column, str) else None
+        )
+        declared_height = (
+            row.get(height_column) if isinstance(height_column, str) else None
+        )
+        minimum = int(qa_config["minimum_dimension"])
+        if (
+            isinstance(declared_width, int)
+            and isinstance(declared_height, int)
+            and min(declared_width, declared_height) < minimum
+        ):
+            _source_rejection(
+                cache_dir,
+                source_id,
+                "declared_dimensions_too_small",
+                {
+                    "width": declared_width,
+                    "height": declared_height,
+                },
+            )
+            continue
+        metadata_text = " ".join(
+            str(row.get(column, ""))
+            for column in metadata_columns
+            if isinstance(column, str)
+        )
+        matched = next(
+            (
+                pattern.pattern
+                for pattern in reject_patterns
+                if pattern.search(metadata_text)
+            ),
+            None,
+        )
+        if matched is not None:
+            _source_rejection(
+                cache_dir,
+                source_id,
+                "metadata_content_filter",
+                {"matched_pattern": matched},
+            )
+            continue
+        image_value = row.get(image_column)
+        cache_key = _json_key(
+            {
+                "kind": "hf-real-photo",
+                "dataset_id": config["dataset_id"],
+                "revision": config["revision"],
+                "split": config["split"],
+                "source_record_id": source_id,
+                "source_url": source_url,
+            }
+        )
+
+        def produce_source(
+            target: Path,
+            value: Any = image_value,
+        ) -> dict[str, Any]:
+            _materialize_hf_image(value, target)
+            health = _image_health(target, qa_config)
+            name = canonical_license[0]
+            source_name_column = config.get("source_name_column")
+            source_name = (
+                row.get(source_name_column)
+                if isinstance(source_name_column, str)
+                else None
+            )
+            return {
+                "source": {
+                    "collection_id": config["dataset_id"],
+                    "source_record_id": source_id,
+                    "landing_page_url": source_url,
+                    "license": {
+                        "name": name,
+                        "url": canonical_license[1],
+                    },
+                    "source_name": source_name,
+                },
+                "capture": None,
+                "generation": None,
+                "scope": {"in_scope": True, "ambiguity_flags": []},
+                "audit": {
+                    "selection_method": "seeded-hf-stream-first-valid-v1",
+                    "source_rank": rank,
+                },
+                "provenance": {
+                    "kind": "huggingface-real-photo-acquisition",
+                    "real_source": {
+                        "dataset_id": config["dataset_id"],
+                        "dataset_revision": config["revision"],
+                        "source_split": config["split"],
+                        "source_row_id": source_id,
+                        "source_url": source_url,
+                        "source_name": source_name,
+                        "declared_license": row.get(license_column),
+                    },
+                    "image_health": health,
+                    "runtime": {
+                        "datasets": _package_version("datasets"),
+                        "pillow": _package_version("Pillow"),
+                    },
+                },
+            }
+
+        try:
+            fields = _cached_sample(
+                cache_dir,
+                cache_key,
+                ".img",
+                produce_source,
+            )
+            path = Path(fields["input_path"])
+            health = fields["provenance"]["image_health"]
+            digest = sha256(path)
+        except (OSError, PipelineError) as error:
+            _source_rejection(
+                cache_dir,
+                source_id,
+                "corrupt_or_invalid_image",
+                {"error": str(error)},
+            )
+            continue
+        if digest in exact_digests:
+            _source_rejection(
+                cache_dir,
+                source_id,
+                "exact_duplicate",
+                {"duplicates_source_record_id": exact_digests[digest]},
+            )
+            continue
+        perceptual_hash = health["perceptual_hash"]
+        max_distance = int(qa_config["near_duplicate_hamming_distance"])
+        near_duplicate = next(
+            (
+                previous_id
+                for previous_hash, previous_id in perceptual_hashes
+                if _hamming_distance(perceptual_hash, previous_hash)
+                <= max_distance
+            ),
+            None,
+        )
+        if near_duplicate is not None:
+            _source_rejection(
+                cache_dir,
+                source_id,
+                "perceptual_near_duplicate",
+                {"duplicates_source_record_id": near_duplicate},
+            )
+            continue
+        qa_key = _json_key(
+            {
+                "kind": "source-photo-screen",
+                "sha256": digest,
+                "qa": qa_config,
+            }
+        )
+        try:
+            qa = _cached_json_result(
+                cache_dir,
+                "qa",
+                qa_key,
+                lambda: qa_runner(path, None, qa_config),
+            )
+        except PipelineError as error:
+            _source_rejection(
+                cache_dir,
+                source_id,
+                "qa_exception",
+                {"error": str(error)},
+            )
+            continue
+        failures = _qa_failures(
+            qa,
+            qa_config,
+            require_alignment=False,
+        )
+        if failures:
+            _source_rejection(
+                cache_dir,
+                source_id,
+                "automated_content_filter",
+                {"failures": failures, "scores": qa},
+            )
+            continue
+        fields["provenance"]["original_sha256"] = digest
+        fields["provenance"]["original_bytes"] = path.stat().st_size
+        fields["provenance"]["source_qa"] = {
+            **qa,
+            "model_id": qa_config["model_id"],
+            "model_revision": qa_config["model_revision"],
+        }
+        exact_digests[digest] = source_id
+        perceptual_hashes.append((perceptual_hash, source_id))
+        selected.append(fields)
+    if len(selected) < needed:
+        raise PipelineError(
+            f"HF source produced {len(selected)} valid unique photos for "
+            f"{needed} deterministic source positions; increase "
+            "real_source.oversample_factor or revise the filters"
+        )
+    return {index: fields for index, fields in enumerate(selected)}
+
+
+def _human_audit_required(
+    group_id: str,
+    seed: int,
+    rate: float,
+) -> bool:
+    value = int.from_bytes(
+        hashlib.sha256(f"{seed}:{group_id}".encode("utf-8")).digest()[:8],
+        "big",
+    )
+    return value / float(2**64) < rate
+
+
+def _quarantine_group(
+    cache_dir: Path,
+    group: dict[str, Any],
+    stage: str,
+    reason: str,
+    details: dict[str, Any],
+) -> Path:
+    path = cache_dir / "quarantine" / (
+        f"{group['semantic_group_id']}.json"
+    )
+    write_json(
+        path,
+        {
+            "schema_version": "1.0.0",
+            "status": "quarantined",
+            "semantic_group_id": group["semantic_group_id"],
+            "source_index": group["source_index"],
+            "split": group["split"],
+            "stage": stage,
+            "reason": reason,
+            "manual_override_status": "none",
+            "details": details,
+        },
+    )
+    return path
+
+
 def preparation_plan(
     spec: dict[str, Any],
     groups: list[dict[str, Any]],
     cache_dir: Path | None = None,
 ) -> dict[str, Any]:
     dataset, _, _, _ = validate_dataset_design(spec)
+    if isinstance(dataset.get("real_source"), dict):
+        return _real_photo_plan(spec, groups)
     prepared_groups = [
         _materialize_group(dataset, group) for group in groups
     ]
@@ -1221,6 +2107,494 @@ def _cached_sample(
     return result
 
 
+def _prepare_real_photo_groups(
+    spec: dict[str, Any],
+    groups: list[dict[str, Any]],
+    cache_dir: Path,
+    *,
+    source_loaders: dict[str, RealSourceLoader] | None,
+    caption_runners: dict[str, CaptionRunner] | None,
+    qa_runners: dict[str, QARunner] | None,
+    generator_runners: dict[str, GeneratorRunner] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    dataset = spec["dataset"]
+    plan = _real_photo_plan(spec, groups)
+    source_config = dataset["real_source"]
+    caption_config = dataset["captioning"]
+    qa_config = dataset["automated_qa"]
+    selection = dataset["generation_selection"]
+    expected_slots = dataset["expected_slots"]
+    generators = dataset["generators"]
+    source_loaders = source_loaders or {
+        "huggingface-dataset": load_huggingface_rows,
+    }
+    caption_runners = caption_runners or {
+        "moondream-local": run_moondream_caption,
+    }
+    qa_runners = qa_runners or {"clip-local": run_clip_qa}
+    generator_runners = generator_runners or {
+        "local-diffusers": run_local_diffusers,
+    }
+    source_loader = source_loaders.get(source_config["adapter"])
+    if source_loader is None:
+        raise PipelineError(
+            f"unknown real source adapter: {source_config['adapter']}"
+        )
+    caption_runner = caption_runners.get(caption_config["adapter"])
+    if caption_runner is None:
+        raise PipelineError(
+            f"unknown caption adapter: {caption_config['adapter']}"
+        )
+    qa_runner = qa_runners.get(qa_config["adapter"])
+    if qa_runner is None:
+        raise PipelineError(
+            f"unknown automated QA adapter: {qa_config['adapter']}"
+        )
+    source_by_index = _select_hf_sources(
+        dataset,
+        groups,
+        cache_dir,
+        source_loader,
+        qa_runner,
+    )
+    real_slot = next(
+        slot for slot in expected_slots
+        if slot["origin_class"] == "real_photo"
+    )
+    synthetic_slots = [
+        slot
+        for slot in expected_slots
+        if slot["origin_class"] == "synthetic"
+    ]
+    candidate_count = int(selection["candidates_per_slot"])
+    seed_base = int(dataset.get("seed_base", 1729))
+    audit_rate = float(selection["human_audit_rate"])
+    samples: list[dict[str, Any]] = []
+    quarantine_files: list[str] = []
+    cache_hits = 0
+    generated_candidate = 0
+    for group_number, configured_group in enumerate(groups, 1):
+        group = {
+            **configured_group,
+            "content_category": configured_group.get(
+                "content_category",
+                "unstratified",
+            ),
+        }
+        group_id = group["semantic_group_id"]
+        stale_quarantine = cache_dir / "quarantine" / f"{group_id}.json"
+        source_fields = deepcopy(source_by_index[int(group["source_index"])])
+        source_path = Path(source_fields["input_path"])
+        source_digest = sha256(source_path)
+        caption_key = _json_key(
+            {
+                "kind": "caption",
+                "source_sha256": source_digest,
+                "captioning": caption_config,
+            }
+        )
+        try:
+            def produce_caption() -> dict[str, Any]:
+                value = caption_runner(source_path, caption_config)
+                if isinstance(value, str):
+                    return {"raw_caption": value}
+                if not isinstance(value, dict):
+                    raise PipelineError(
+                        "caption adapter returned neither text nor an object"
+                    )
+                return value
+
+            caption_result = _cached_json_result(
+                cache_dir,
+                "captions",
+                caption_key,
+                produce_caption,
+            )
+            cache_hits += int(caption_result.pop("_cache_hit", False))
+            raw_caption = caption_result.get("raw_caption")
+            if not isinstance(raw_caption, str):
+                raw_caption = caption_result.get("caption")
+            normalized_caption = normalize_caption(
+                raw_caption,
+                caption_config["normalization_policy"],
+            )
+            prompt = _render_caption_prompt(
+                group_id,
+                normalized_caption,
+                dataset["prompt_policy"],
+            )
+        except Exception as error:
+            quarantine = _quarantine_group(
+                cache_dir,
+                group,
+                "captioning",
+                "caption_exception",
+                {
+                    "error": str(error),
+                    "source_record_id": source_fields["source"][
+                        "source_record_id"
+                    ],
+                    "source_sha256": source_digest,
+                },
+            )
+            quarantine_files.append(str(quarantine))
+            continue
+        group.update(
+            {
+                "prompt": prompt,
+                "concept": {
+                    "concept_id": prompt["prompt_id"],
+                    "text": normalized_caption.rstrip("."),
+                    "frozen": True,
+                },
+                "prompt_policy": deepcopy(dataset["prompt_policy"]),
+            }
+        )
+        real_qa_key = _json_key(
+            {
+                "kind": "caption-alignment",
+                "source_sha256": source_digest,
+                "caption": normalized_caption,
+                "qa": qa_config,
+            }
+        )
+        try:
+            real_qa = _cached_json_result(
+                cache_dir,
+                "qa",
+                real_qa_key,
+                lambda: qa_runner(
+                    source_path,
+                    normalized_caption,
+                    qa_config,
+                ),
+            )
+            cache_hits += int(real_qa.pop("_cache_hit", False))
+        except Exception as error:
+            quarantine = _quarantine_group(
+                cache_dir,
+                group,
+                "real-image-qa",
+                "qa_exception",
+                {"error": str(error), "caption": normalized_caption},
+            )
+            quarantine_files.append(str(quarantine))
+            continue
+        real_failures = _qa_failures(
+            real_qa,
+            qa_config,
+            require_alignment=True,
+        )
+        if real_failures:
+            quarantine = _quarantine_group(
+                cache_dir,
+                group,
+                "real-image-qa",
+                "real_image_failed_qa",
+                {
+                    "failures": real_failures,
+                    "scores": real_qa,
+                    "caption": normalized_caption,
+                },
+            )
+            quarantine_files.append(str(quarantine))
+            continue
+        audit_required = _human_audit_required(
+            group_id,
+            seed_base,
+            audit_rate,
+        )
+        caption_lineage = {
+            "raw_caption": raw_caption.strip(),
+            "normalized_caption": normalized_caption,
+            "caption_policy_version": caption_config[
+                "normalization_policy"
+            ],
+            "model_id": caption_config["model_id"],
+            "model_revision": caption_config["model_revision"],
+            "settings": {
+                "length": caption_config["length"],
+                "temperature": caption_config["temperature"],
+            },
+            "runtime": caption_result.get("runtime", {}),
+        }
+        source_lineage = {
+            "source_photo_group_id": group_id,
+            "hf_dataset_id": source_config["dataset_id"],
+            "hf_dataset_revision": source_config["revision"],
+            "source_split": source_config["split"],
+            "source_row_id": source_fields["source"]["source_record_id"],
+            "source_url": source_fields["source"]["landing_page_url"],
+            "original_sha256": source_digest,
+            "original_bytes": source_path.stat().st_size,
+        }
+        source_fields["provenance"].update(
+            {
+                "captioning": caption_lineage,
+                "lineage": source_lineage,
+                "quarantine_status": "accepted",
+                "manual_override_status": "none",
+                "automated_qa": {
+                    "model_id": qa_config["model_id"],
+                    "model_revision": qa_config["model_revision"],
+                    "thresholds": {
+                        "alignment": qa_config["alignment_threshold"],
+                        "photo_probability_min": qa_config.get(
+                            "photo_probability_min"
+                        ),
+                        "unsafe_probability_max": qa_config.get(
+                            "unsafe_probability_max"
+                        ),
+                    },
+                    "scores": real_qa,
+                },
+            }
+        )
+        source_fields.setdefault("audit", {}).update(
+            {
+                "selection_method": "seeded-hf-stream-first-valid-v1",
+                "human_audit_required": audit_required,
+                "human_audit_status": "pending" if audit_required else "not-sampled",
+                "manual_override_status": "none",
+            }
+        )
+        real_sample = {
+            "semantic_group_id": group_id,
+            "content_category": group["content_category"],
+            "split": group["split"],
+            "prompt": prompt,
+            **source_fields,
+            "sample_id": f"{group_id}-{real_slot['slot_id']}",
+            "slot_id": real_slot["slot_id"],
+            "origin_class": "real_photo",
+        }
+        group_samples = [real_sample]
+        group_failure: tuple[str, dict[str, Any]] | None = None
+        for slot in synthetic_slots:
+            slot_id = slot["slot_id"]
+            family = slot["generator_family"]
+            generator_config = generators[family]
+            runner = generator_runners.get(generator_config["adapter"])
+            if runner is None:
+                raise PipelineError(
+                    f"unknown generator adapter: {generator_config['adapter']}"
+                )
+            sample_id = f"{group_id}-{slot_id}"
+            candidate_records: list[dict[str, Any]] = []
+            passing_fields: dict[int, dict[str, Any]] = {}
+            for candidate_index in range(candidate_count):
+                seed = _candidate_seed(
+                    seed_base,
+                    group_id,
+                    slot_id,
+                    candidate_index,
+                )
+                cache_key = _json_key(
+                    {
+                        "kind": "synthetic-v2",
+                        "group": group,
+                        "source_lineage": source_lineage,
+                        "slot": slot,
+                        "config": generator_config,
+                        "candidate_index": candidate_index,
+                        "seed": seed,
+                    }
+                )
+                generated_candidate += 1
+                try:
+                    fields = _cached_sample(
+                        cache_dir,
+                        cache_key,
+                        ".png",
+                        lambda target, candidate_seed=seed: runner(
+                            group,
+                            generator_config,
+                            candidate_seed,
+                            target,
+                        ),
+                    )
+                    cache_hits += int(
+                        fields.get("audit", {}).get("cache_hit") is True
+                    )
+                    candidate_path = Path(fields["input_path"])
+                    health = _image_health(candidate_path, qa_config)
+                    candidate_digest = sha256(candidate_path)
+                    qa_key = _json_key(
+                        {
+                            "kind": "generated-caption-alignment",
+                            "sha256": candidate_digest,
+                            "caption": normalized_caption,
+                            "qa": qa_config,
+                        }
+                    )
+                    candidate_qa = _cached_json_result(
+                        cache_dir,
+                        "qa",
+                        qa_key,
+                        lambda: qa_runner(
+                            candidate_path,
+                            normalized_caption,
+                            qa_config,
+                        ),
+                    )
+                    cache_hits += int(
+                        candidate_qa.pop("_cache_hit", False)
+                    )
+                    failures = _qa_failures(
+                        candidate_qa,
+                        qa_config,
+                        require_alignment=True,
+                    )
+                    candidate_record = {
+                        "candidate_index": candidate_index,
+                        "seed": seed,
+                        "sha256": candidate_digest,
+                        "bytes": candidate_path.stat().st_size,
+                        "image_health": health,
+                        "qa_scores": candidate_qa,
+                        "failures": failures,
+                        "passed": not failures,
+                    }
+                    if not failures:
+                        passing_fields[candidate_index] = fields
+                except Exception as error:
+                    candidate_record = {
+                        "candidate_index": candidate_index,
+                        "seed": seed,
+                        "passed": False,
+                        "failures": ["exception"],
+                        "error": str(error),
+                    }
+                candidate_records.append(candidate_record)
+            selected_candidate = next(
+                (
+                    candidate
+                    for candidate in candidate_records
+                    if candidate.get("passed") is True
+                ),
+                None,
+            )
+            if selected_candidate is None:
+                group_failure = (
+                    slot_id,
+                    {
+                        "reason": "all_generated_candidates_failed",
+                        "candidates": candidate_records,
+                    },
+                )
+                break
+            selected_index = int(selected_candidate["candidate_index"])
+            fields = passing_fields[selected_index]
+            fields["scope"] = {"in_scope": True, "ambiguity_flags": []}
+            fields.setdefault("generation", {}).update(
+                {
+                    "candidate_index": selected_index,
+                    "candidate_count": candidate_count,
+                    "rendered_prompt": prompt["text"],
+                    "prompt_template_id": dataset["prompt_policy"][
+                        "template_id"
+                    ],
+                }
+            )
+            fields.setdefault("audit", {}).update(
+                {
+                    "selection_method": selection["method"],
+                    "review_status": "not-required",
+                    "candidate_index": selected_index,
+                    "candidate_count": candidate_count,
+                    "candidate_qa": candidate_records,
+                    "human_audit_required": audit_required,
+                    "human_audit_status": (
+                        "pending" if audit_required else "not-sampled"
+                    ),
+                    "manual_override_status": "none",
+                }
+            )
+            fields.setdefault("provenance", {}).update(
+                {
+                    "lineage": source_lineage,
+                    "captioning": caption_lineage,
+                    "automated_qa": {
+                        "model_id": qa_config["model_id"],
+                        "model_revision": qa_config["model_revision"],
+                        "thresholds": {
+                            "alignment": qa_config[
+                                "alignment_threshold"
+                            ],
+                            "photo_probability_min": qa_config.get(
+                                "photo_probability_min"
+                            ),
+                            "unsafe_probability_max": qa_config.get(
+                                "unsafe_probability_max"
+                            ),
+                        },
+                        "selected_scores": selected_candidate["qa_scores"],
+                    },
+                    "candidate_index": selected_index,
+                    "candidate_count": candidate_count,
+                    "selection_method": selection["method"],
+                    "candidates": candidate_records,
+                    "quarantine_status": "accepted",
+                    "manual_override_status": "none",
+                }
+            )
+            fields["source"] = {
+                "collection_id": f"mai-{family}-generation",
+                "source_record_id": sample_id,
+                "landing_page_url": (
+                    f"https://huggingface.co/{generator_config['model_id']}"
+                ),
+                "license": {
+                    "name": "model-output-license",
+                    "url": generator_config["output_terms_url"],
+                },
+            }
+            group_samples.append(
+                {
+                    "semantic_group_id": group_id,
+                    "content_category": group["content_category"],
+                    "split": group["split"],
+                    "prompt": prompt,
+                    **fields,
+                    "sample_id": sample_id,
+                    "slot_id": slot_id,
+                    "origin_class": "synthetic",
+                }
+            )
+        if group_failure is not None:
+            failed_slot, failure_details = group_failure
+            quarantine = _quarantine_group(
+                cache_dir,
+                group,
+                "generation-qa",
+                failure_details["reason"],
+                {
+                    "failed_slot": failed_slot,
+                    "caption": normalized_caption,
+                    "source_lineage": source_lineage,
+                    **failure_details,
+                },
+            )
+            quarantine_files.append(str(quarantine))
+            continue
+        stale_quarantine.unlink(missing_ok=True)
+        samples.extend(group_samples)
+        print(
+            f"[prepare {group_number}/{len(groups)}] {group_id} "
+            f"({len(group_samples)} accepted samples)",
+            flush=True,
+        )
+    plan.update(
+        {
+            "cache_hits": cache_hits,
+            "accepted_group_count": len(samples) // len(expected_slots),
+            "quarantined_group_count": len(quarantine_files),
+            "quarantine_files": quarantine_files,
+        }
+    )
+    return samples, plan
+
+
 def prepare_groups(
     spec: dict[str, Any],
     groups: list[dict[str, Any]],
@@ -1228,7 +2602,20 @@ def prepare_groups(
     *,
     camera_fetchers: dict[str, CameraFetcher] | None = None,
     generator_runners: dict[str, GeneratorRunner] | None = None,
+    source_loaders: dict[str, RealSourceLoader] | None = None,
+    caption_runners: dict[str, CaptionRunner] | None = None,
+    qa_runners: dict[str, QARunner] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if isinstance(spec.get("dataset", {}).get("real_source"), dict):
+        return _prepare_real_photo_groups(
+            spec,
+            groups,
+            cache_dir,
+            source_loaders=source_loaders,
+            caption_runners=caption_runners,
+            qa_runners=qa_runners,
+            generator_runners=generator_runners,
+        )
     plan = preparation_plan(spec, groups, cache_dir)
     if plan["missing_credentials"]:
         raise PipelineError(

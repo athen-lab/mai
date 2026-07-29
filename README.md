@@ -1,15 +1,16 @@
 # Multilayer Authenticity Identifier (MAI)
 
-MAI studies the representation geometry of provenance-verifiable camera
-photographs and fully generated photorealistic images. The immediate goal is an
+MAI studies the representation geometry of license-auditable real photographs
+and fully generated photorealistic images. The immediate goal is an
 embedding atlas across encoders, layers, generator families, and controlled
 transformations—not another production detector.
 
 This Git repository is the dataset **control plane**: it contains the workbench,
 build/validation/publishing code, documentation, and tests. Images and release
 metadata are the **data plane** and belong in a Hugging Face dataset repository.
-The canonical design is checked in at `specs/v1.json`. Local inputs and build
-directories live under ignored `.mai-data/`.
+The current paired-photo pilot is checked in at `specs/v2.json`;
+`specs/v1.json` remains reproducible as the earlier camera-evidence protocol.
+Local inputs and build directories live under ignored `.mai-data/`.
 
 ## Start here
 
@@ -31,16 +32,14 @@ nix develop "path:$PWD"
 ```
 
 `Build dataset` is the first workbench operation. Its popup lets you select
-exact semantic groups from the build spec. Build downloads screened camera
-photographs and generates every synthetic counterpart on demand, caches those
-inputs, and writes a visual candidate grid. After explicit first-passing review,
-the same Build command reuses the cache, normalizes the selected images, embeds
-the analysis images and typed metadata in Parquet shards, and validates the
-local package. Byte-identical originals and provenance receipts remain as audit
-sidecars. Synthetic images are generated locally with Diffusers—no paid
-image-generation API is configured.
-The same path builds three groups for a smoke test or all 200 groups for the
-preliminary run.
+exact source-photo groups from the build spec. V2 deterministically samples a
+pinned Hugging Face source, captions each accepted real photo with pinned local
+Moondream, freezes the normalized caption, and generates every synthetic
+counterpart. Pinned CLIP QA selects the first passing candidate automatically;
+failed groups are quarantined with receipts. The builder then applies identical
+normalization, embeds analysis images and typed metadata in Parquet, and
+validates the package. Byte-identical originals and full lineage remain as
+audit sidecars. No paid generation API is configured.
 
 The workbench also initializes specs, validates packages, publishes releases,
 and downloads exact groups from a pinned Hugging Face revision. Every field is

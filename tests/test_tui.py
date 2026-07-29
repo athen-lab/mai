@@ -24,7 +24,7 @@ class FormTests(unittest.TestCase):
         self.assertEqual(OPERATIONS[0][0], "build")
         form = create_form("build")
         self.assertIsInstance(form, BuildForm)
-        self.assertEqual(form.spec, "specs/v1.json")
+        self.assertEqual(form.spec, "specs/v2.json")
 
     def test_checked_in_v1_supports_the_real_run_matrix(self) -> None:
         repository = Path(__file__).resolve().parents[1]

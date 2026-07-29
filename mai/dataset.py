@@ -31,6 +31,7 @@ PARQUET_SHARD_TARGET_BYTES = 256 * 1024 * 1024
 PARQUET_ROW_GROUP_SIZE = 100
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 NORMALIZATION = {
     "transformation_id": "normalize-imagemagick-v1",
     "tool": "ImageMagick",
@@ -254,16 +255,20 @@ def validate_dataset_design(
         if slot_id in slot_by_id:
             raise PipelineError(f"duplicate expected slot: {slot_id}")
         origin = slot.get("origin_class")
-        if origin not in {"camera", "synthetic"}:
+        if origin not in {"camera", "real_photo", "synthetic"}:
             raise PipelineError(f"{slot_id}: invalid expected origin_class")
         if origin == "synthetic":
             require_id(slot.get("generator_family"), f"{slot_id}.generator_family")
         slot_by_id[slot_id] = slot
-    camera_slots = [
-        slot for slot in expected_slots if slot["origin_class"] == "camera"
+    real_slots = [
+        slot
+        for slot in expected_slots
+        if slot["origin_class"] in {"camera", "real_photo"}
     ]
-    if len(camera_slots) != 1:
-        raise PipelineError("expected_slots must contain exactly one camera slot")
+    if len(real_slots) != 1:
+        raise PipelineError(
+            "expected_slots must contain exactly one camera or real_photo slot"
+        )
     families = {
         slot["generator_family"]
         for slot in expected_slots
@@ -271,6 +276,187 @@ def validate_dataset_design(
     }
     if len(families) < 2:
         raise PipelineError("expected_slots must contain at least two generator families")
+    real_source = dataset.get("real_source")
+    if real_slots[0]["origin_class"] == "real_photo":
+        if not isinstance(real_source, dict):
+            raise PipelineError(
+                "dataset.real_source is required for a real_photo slot"
+            )
+        required_source_fields = (
+            "adapter",
+            "dataset_id",
+            "revision",
+            "split",
+            "image_column",
+            "id_column",
+            "license_column",
+            "source_url_column",
+            "sample_seed",
+        )
+        for field in required_source_fields:
+            if real_source.get(field) in (None, ""):
+                raise PipelineError(f"dataset.real_source.{field} is required")
+        if real_source.get("adapter") != "huggingface-dataset":
+            raise PipelineError(
+                "dataset.real_source.adapter must be 'huggingface-dataset'"
+            )
+        if not COMMIT_PATTERN.fullmatch(str(real_source.get("revision", ""))):
+            raise PipelineError(
+                "dataset.real_source.revision must be a 40-character "
+                "lowercase commit SHA"
+            )
+        if not isinstance(real_source.get("sample_seed"), int):
+            raise PipelineError(
+                "dataset.real_source.sample_seed must be an integer"
+            )
+        license_policy = real_source.get("license_policy")
+        allowed = (
+            license_policy.get("allowed")
+            if isinstance(license_policy, dict)
+            else None
+        )
+        if (
+            not isinstance(allowed, list)
+            or not allowed
+            or not all(isinstance(item, str) and item for item in allowed)
+        ):
+            raise PipelineError(
+                "dataset.real_source.license_policy.allowed must be a "
+                "non-empty string array"
+            )
+        captioning = dataset.get("captioning")
+        if not isinstance(captioning, dict):
+            raise PipelineError("dataset.captioning is required")
+        for field in (
+            "adapter",
+            "model_id",
+            "model_revision",
+            "length",
+            "temperature",
+            "normalization_policy",
+        ):
+            if captioning.get(field) in (None, ""):
+                raise PipelineError(f"dataset.captioning.{field} is required")
+        if captioning.get("adapter") != "moondream-local":
+            raise PipelineError(
+                "dataset.captioning.adapter must be 'moondream-local'"
+            )
+        if not COMMIT_PATTERN.fullmatch(
+            str(captioning.get("model_revision", ""))
+        ):
+            raise PipelineError(
+                "dataset.captioning.model_revision must be a 40-character "
+                "lowercase commit SHA"
+            )
+        if captioning.get("temperature") != 0:
+            raise PipelineError(
+                "dataset.captioning.temperature must be 0 for deterministic "
+                "captioning"
+            )
+        if captioning.get("normalization_policy") != "content-only-v1":
+            raise PipelineError(
+                "dataset.captioning.normalization_policy must be "
+                "'content-only-v1'"
+            )
+        prompt_policy = dataset.get("prompt_policy")
+        if (
+            not isinstance(prompt_policy, dict)
+            or not isinstance(prompt_policy.get("template_id"), str)
+            or not isinstance(prompt_policy.get("template"), str)
+            or "{caption}" not in prompt_policy["template"]
+        ):
+            raise PipelineError(
+                "dataset.prompt_policy must define template_id and a template "
+                "containing {caption}"
+            )
+        qa = dataset.get("automated_qa")
+        if not isinstance(qa, dict):
+            raise PipelineError("dataset.automated_qa is required")
+        for field in (
+            "adapter",
+            "model_id",
+            "model_revision",
+            "alignment_threshold",
+            "minimum_dimension",
+            "blank_stddev_min",
+            "near_duplicate_hamming_distance",
+        ):
+            if qa.get(field) in (None, ""):
+                raise PipelineError(f"dataset.automated_qa.{field} is required")
+        if qa.get("adapter") != "clip-local":
+            raise PipelineError(
+                "dataset.automated_qa.adapter must be 'clip-local'"
+            )
+        if not COMMIT_PATTERN.fullmatch(str(qa.get("model_revision", ""))):
+            raise PipelineError(
+                "dataset.automated_qa.model_revision must be a 40-character "
+                "lowercase commit SHA"
+            )
+        for field in ("alignment_threshold", "blank_stddev_min"):
+            if not isinstance(qa.get(field), (int, float)):
+                raise PipelineError(
+                    f"dataset.automated_qa.{field} must be numeric"
+                )
+        for field in ("minimum_dimension", "near_duplicate_hamming_distance"):
+            if not isinstance(qa.get(field), int) or qa[field] < 0:
+                raise PipelineError(
+                    f"dataset.automated_qa.{field} must be a non-negative integer"
+                )
+        selection = dataset.get("generation_selection")
+        if not isinstance(selection, dict):
+            raise PipelineError("dataset.generation_selection is required")
+        candidates = selection.get("candidates_per_slot")
+        if not isinstance(candidates, int) or not 1 <= candidates <= 16:
+            raise PipelineError(
+                "dataset.generation_selection.candidates_per_slot must be 1..16"
+            )
+        if selection.get("method") != "automatic-first-passing-v1":
+            raise PipelineError(
+                "dataset.generation_selection.method must be "
+                "'automatic-first-passing-v1'"
+            )
+        if selection.get("quarantine_on_failure") is not True:
+            raise PipelineError(
+                "dataset.generation_selection.quarantine_on_failure must be true"
+            )
+        audit_rate = selection.get("human_audit_rate")
+        if (
+            not isinstance(audit_rate, (int, float))
+            or not 0 <= float(audit_rate) <= 1
+        ):
+            raise PipelineError(
+                "dataset.generation_selection.human_audit_rate must be 0..1"
+            )
+        generators = dataset.get("generators")
+        if not isinstance(generators, dict):
+            raise PipelineError("dataset.generators object is required")
+        for family in sorted(families):
+            config = generators.get(family)
+            if not isinstance(config, dict):
+                raise PipelineError(f"no generator configured for family {family}")
+            if config.get("family_id") != family:
+                raise PipelineError(
+                    f"generator configuration differs for {family}"
+                )
+            for field in (
+                "adapter",
+                "model_id",
+                "settings",
+                "output_terms_url",
+            ):
+                if config.get(field) in (None, ""):
+                    raise PipelineError(f"{family}.{field} is required")
+            if not COMMIT_PATTERN.fullmatch(
+                str(config.get("model_revision", ""))
+            ):
+                raise PipelineError(
+                    f"{family}.model_revision must be a 40-character "
+                    "lowercase commit SHA"
+                )
+    elif real_source is not None:
+        raise PipelineError(
+            "dataset.real_source requires a real_photo expected slot"
+        )
     return dataset, slot_by_id, families, target_group_count
 
 
@@ -282,6 +468,7 @@ def validate_spec(
     dataset, slot_by_id, families, target_group_count = (
         validate_dataset_design(spec)
     )
+    real_photo_pipeline = isinstance(dataset.get("real_source"), dict)
     expected_slots = dataset["expected_slots"]
     if not samples:
         raise PipelineError("build spec contains no samples")
@@ -356,6 +543,15 @@ def validate_spec(
                 raise PipelineError(f"{sample_id}: camera edit screen must pass")
             if sample.get("generation") is not None:
                 raise PipelineError(f"{sample_id}: camera generation must be null")
+        elif origin == "real_photo":
+            if sample.get("capture") is not None:
+                raise PipelineError(
+                    f"{sample_id}: real_photo capture must be null"
+                )
+            if sample.get("generation") is not None:
+                raise PipelineError(
+                    f"{sample_id}: real_photo generation must be null"
+                )
         else:
             generation = sample.get("generation")
             if not isinstance(generation, dict):
@@ -403,6 +599,203 @@ def validate_spec(
             raise PipelineError(f"{group_id}: samples must share one content category")
         if len(group_splits[group_id]) != 1:
             raise PipelineError(f"{group_id}: samples must share one split")
+    if real_photo_pipeline:
+        source_rows: set[tuple[str, str, str]] = set()
+        source_hashes: set[str] = set()
+        perceptual_hashes: list[tuple[str, str]] = []
+        qa_design = dataset["automated_qa"]
+        caption_design = dataset["captioning"]
+        selection_design = dataset["generation_selection"]
+        real_slot_id = next(
+            slot_id
+            for slot_id, slot in slot_by_id.items()
+            if slot["origin_class"] == "real_photo"
+        )
+        for group_id, slots in matrix.items():
+            real_sample = slots[real_slot_id]
+            provenance = real_sample.get("provenance")
+            if not isinstance(provenance, dict):
+                raise PipelineError(
+                    f"{group_id}: real_photo provenance is required"
+                )
+            lineage = provenance.get("lineage")
+            captioning = provenance.get("captioning")
+            qa = provenance.get("automated_qa")
+            real_source = provenance.get("real_source")
+            if not isinstance(real_source, dict):
+                raise PipelineError(
+                    f"{group_id}: HF real-source lineage is missing"
+                )
+            expected_source = dataset["real_source"]
+            required_source = {
+                "dataset_id": expected_source["dataset_id"],
+                "dataset_revision": expected_source["revision"],
+                "source_split": expected_source["split"],
+            }
+            for field, expected_value in required_source.items():
+                if real_source.get(field) != expected_value:
+                    raise PipelineError(
+                        f"{group_id}: real_source.{field} differs from "
+                        "the pinned contract"
+                    )
+            source_row_id = real_source.get("source_row_id")
+            if not isinstance(source_row_id, str) or not source_row_id:
+                raise PipelineError(
+                    f"{group_id}: real_source.source_row_id is required"
+                )
+            source_key = (
+                expected_source["dataset_id"],
+                expected_source["revision"],
+                source_row_id,
+            )
+            if source_key in source_rows:
+                raise PipelineError(
+                    f"{group_id}: HF source row is reused"
+                )
+            source_rows.add(source_key)
+            if not isinstance(lineage, dict):
+                raise PipelineError(f"{group_id}: source lineage is missing")
+            if (
+                provenance.get("quarantine_status") != "accepted"
+                or provenance.get("manual_override_status") not in {
+                    "none",
+                    "applied",
+                }
+            ):
+                raise PipelineError(
+                    f"{group_id}: source quarantine/override status is missing"
+                )
+            if lineage.get("source_photo_group_id") != group_id:
+                raise PipelineError(
+                    f"{group_id}: source lineage group differs"
+                )
+            input_path = sample_input_path(spec_path, real_sample)
+            digest = sha256(input_path)
+            if (
+                lineage.get("original_sha256") != digest
+                or lineage.get("original_bytes") != input_path.stat().st_size
+            ):
+                raise PipelineError(
+                    f"{group_id}: source checksum lineage differs"
+                )
+            if digest in source_hashes:
+                raise PipelineError(
+                    f"{group_id}: exact duplicate real photo"
+                )
+            source_hashes.add(digest)
+            image_health = provenance.get("image_health")
+            perceptual_hash = (
+                image_health.get("perceptual_hash")
+                if isinstance(image_health, dict)
+                else None
+            )
+            if (
+                not isinstance(perceptual_hash, str)
+                or not re.fullmatch(r"[0-9a-f]{16}", perceptual_hash)
+            ):
+                raise PipelineError(
+                    f"{group_id}: perceptual hash lineage is missing"
+                )
+            max_distance = qa_design["near_duplicate_hamming_distance"]
+            near = next(
+                (
+                    previous_group
+                    for previous_hash, previous_group in perceptual_hashes
+                    if (
+                        int(perceptual_hash, 16) ^ int(previous_hash, 16)
+                    ).bit_count()
+                    <= max_distance
+                ),
+                None,
+            )
+            if near is not None:
+                raise PipelineError(
+                    f"{group_id}: perceptual near-duplicate of {near}"
+                )
+            perceptual_hashes.append((perceptual_hash, group_id))
+            if not isinstance(captioning, dict):
+                raise PipelineError(
+                    f"{group_id}: caption lineage is missing"
+                )
+            for field in ("raw_caption", "normalized_caption"):
+                if not isinstance(captioning.get(field), str) or not captioning[field]:
+                    raise PipelineError(
+                        f"{group_id}: captioning.{field} is required"
+                    )
+            if (
+                captioning.get("caption_policy_version")
+                != caption_design["normalization_policy"]
+                or captioning.get("model_id") != caption_design["model_id"]
+                or captioning.get("model_revision")
+                != caption_design["model_revision"]
+            ):
+                raise PipelineError(
+                    f"{group_id}: caption lineage differs from contract"
+                )
+            if (
+                not isinstance(qa, dict)
+                or qa.get("model_id") != qa_design["model_id"]
+                or qa.get("model_revision") != qa_design["model_revision"]
+            ):
+                raise PipelineError(
+                    f"{group_id}: real-photo QA lineage differs from contract"
+                )
+            for slot_id, sample in slots.items():
+                if sample["origin_class"] != "synthetic":
+                    continue
+                synthetic_provenance = sample.get("provenance")
+                if not isinstance(synthetic_provenance, dict):
+                    raise PipelineError(
+                        f"{sample['sample_id']}: synthetic lineage is missing"
+                    )
+                if synthetic_provenance.get("lineage") != lineage:
+                    raise PipelineError(
+                        f"{sample['sample_id']}: source-photo lineage differs"
+                    )
+                if synthetic_provenance.get("captioning") != captioning:
+                    raise PipelineError(
+                        f"{sample['sample_id']}: frozen caption lineage differs"
+                    )
+                if (
+                    synthetic_provenance.get("selection_method")
+                    != selection_design["method"]
+                ):
+                    raise PipelineError(
+                        f"{sample['sample_id']}: selection method differs"
+                    )
+                if (
+                    synthetic_provenance.get("quarantine_status")
+                    != "accepted"
+                    or synthetic_provenance.get("manual_override_status")
+                    not in {"none", "applied"}
+                ):
+                    raise PipelineError(
+                        f"{sample['sample_id']}: quarantine/override status "
+                        "is missing"
+                    )
+                candidates = synthetic_provenance.get("candidates")
+                selected_index = synthetic_provenance.get("candidate_index")
+                if (
+                    not isinstance(candidates, list)
+                    or len(candidates)
+                    != selection_design["candidates_per_slot"]
+                    or not isinstance(selected_index, int)
+                ):
+                    raise PipelineError(
+                        f"{sample['sample_id']}: candidate lineage is incomplete"
+                    )
+                passing_indexes = [
+                    candidate.get("candidate_index")
+                    for candidate in candidates
+                    if (
+                        isinstance(candidate, dict)
+                        and candidate.get("passed") is True
+                    )
+                ]
+                if not passing_indexes or selected_index != passing_indexes[0]:
+                    raise PipelineError(
+                        f"{sample['sample_id']}: selection is not first-passing"
+                    )
     return {
         "group_count": len(matrix),
         "sample_count": len(samples),
@@ -475,7 +868,12 @@ def validate_group_catalog(spec: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(configured_groups, list) or not configured_groups:
         raise PipelineError("build spec groups must be a non-empty array")
     result: list[dict[str, Any]] = []
+    real_photo_pipeline = isinstance(
+        spec.get("dataset", {}).get("real_source"),
+        dict,
+    )
     seen: set[str] = set()
+    source_indexes: set[int] = set()
     for group in configured_groups:
         if not isinstance(group, dict):
             raise PipelineError("every group must be an object")
@@ -487,18 +885,36 @@ def validate_group_catalog(spec: dict[str, Any]) -> list[dict[str, Any]]:
             raise PipelineError(f"duplicate semantic_group_id: {group_id}")
         seen.add(group_id)
         category = group.get("content_category")
+        if real_photo_pipeline and category is None:
+            category = "unstratified"
         if not isinstance(category, str) or not category.strip():
             raise PipelineError(f"{group_id}: content_category is required")
         split = require_id(group.get("split"), f"{group_id}.split")
         prompt = group.get("prompt")
-        if (
-            not isinstance(prompt, dict)
-            or not isinstance(prompt.get("text"), str)
-            or not prompt["text"].strip()
-            or prompt.get("frozen") is not True
-        ):
-            raise PipelineError(f"{group_id}: a frozen prompt is required")
-        require_id(prompt.get("prompt_id"), f"{group_id}.prompt.prompt_id")
+        if real_photo_pipeline:
+            if prompt is not None:
+                raise PipelineError(
+                    f"{group_id}: prompt must be omitted until captioning"
+                )
+            source_index = group.get("source_index")
+            if not isinstance(source_index, int) or source_index < 0:
+                raise PipelineError(
+                    f"{group_id}: source_index must be a non-negative integer"
+                )
+            if source_index in source_indexes:
+                raise PipelineError(
+                    f"duplicate real-photo source_index: {source_index}"
+                )
+            source_indexes.add(source_index)
+        else:
+            if (
+                not isinstance(prompt, dict)
+                or not isinstance(prompt.get("text"), str)
+                or not prompt["text"].strip()
+                or prompt.get("frozen") is not True
+            ):
+                raise PipelineError(f"{group_id}: a frozen prompt is required")
+            require_id(prompt.get("prompt_id"), f"{group_id}.prompt.prompt_id")
         samples = group.get("samples", [])
         if not isinstance(samples, list) or not all(
             isinstance(sample, dict) for sample in samples
@@ -510,8 +926,8 @@ def validate_group_catalog(spec: dict[str, Any]) -> list[dict[str, Any]]:
                 "semantic_group_id": group_id,
                 "content_category": category,
                 "split": split,
-                "prompt": prompt,
                 "samples": samples,
+                **({"prompt": prompt} if prompt is not None else {}),
             }
         )
     return result
@@ -1019,6 +1435,11 @@ def dataset_card(contract: dict[str, Any]) -> str:
             ]
         )
     configs = "\n".join(config_lines)
+    origin_tag = (
+        "real-photo"
+        if isinstance(contract.get("design", {}).get("real_source"), dict)
+        else "camera-provenance"
+    )
     return f"""---
 pretty_name: {json.dumps(title)}
 license: other
@@ -1028,7 +1449,7 @@ tags:
 - image
 - image-forensics
 - ai-generated-image-detection
-- camera-provenance
+- {origin_tag}
 {configs}
 ---
 
@@ -1176,10 +1597,21 @@ def build_package(
             for sample in samples
         }
     )
-    if not group_ids and summary["group_count"] < summary["target_group_count"]:
+    quarantined_group_count = (
+        int(preparation.get("quarantined_group_count", 0))
+        if isinstance(preparation, dict)
+        else 0
+    )
+    if (
+        not group_ids
+        and summary["group_count"] + quarantined_group_count
+        < summary["target_group_count"]
+    ):
         raise PipelineError(
             "full build is below dataset.target_group_count: "
-            f"{summary['group_count']} of {summary['target_group_count']} groups; "
+            f"{summary['group_count']} accepted plus "
+            f"{quarantined_group_count} quarantined of "
+            f"{summary['target_group_count']} groups; "
             "select explicit --group-id values for a smoke build"
         )
     if preparation is not None:
@@ -1216,6 +1648,8 @@ def build_package(
             "selection": {
                 "method": "explicit" if group_ids else "all",
                 "semantic_groups": summary["selected_group_ids"],
+                "requested_semantic_groups": sorted(selected),
+                "quarantined_group_count": quarantined_group_count,
                 "sample_count": summary["sample_count"],
             },
             "normalization": profile,
@@ -1229,14 +1663,39 @@ def build_package(
                 "prompt_policy": dataset_spec.get("prompt_policy"),
                 "generation_review": dataset_spec.get("generation_review"),
                 "camera_acquisition": dataset_spec.get("camera_acquisition"),
+                "real_source": dataset_spec.get("real_source"),
+                "captioning": dataset_spec.get("captioning"),
+                "automated_qa": dataset_spec.get("automated_qa"),
+                "generation_selection": dataset_spec.get(
+                    "generation_selection"
+                ),
                 "generators": dataset_spec.get("generators"),
             },
             "files": {
                 "group_index": "groups.json",
                 "validation_report": "validation_report.json",
                 "data": {},
+                "quarantine": [],
             },
         }
+        if isinstance(preparation, dict):
+            for value in preparation.get("quarantine_files", []):
+                source_path = Path(value).resolve()
+                if not source_path.is_file():
+                    raise PipelineError(
+                        f"quarantine receipt is missing: {source_path}"
+                    )
+                relative = Path("quarantine") / source_path.name
+                target = staging / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source_path, target)
+                contract["files"]["quarantine"].append(
+                    {
+                        "path": relative.as_posix(),
+                        "sha256": sha256(target),
+                        "bytes": target.stat().st_size,
+                    }
+                )
         records_by_split: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for index, sample in enumerate(
             sorted(
@@ -1257,7 +1716,7 @@ def build_package(
             family = (
                 sample.get("generation", {}).get("family_id", "camera")
                 if sample["origin_class"] == "synthetic"
-                else "camera"
+                else sample["origin_class"]
             )
             original_relative = (
                 Path("originals")
@@ -1570,6 +2029,8 @@ def validate_package(package: Path) -> tuple[int, dict[str, Any]]:
         if isinstance(review_design, dict)
         else None
     )
+    real_source_design = contract.get("design", {}).get("real_source")
+    real_photo_pipeline = isinstance(real_source_design, dict)
     for record in records:
         sample_id = record.get("sample_id", "<missing>")
         validation.require(
@@ -1593,7 +2054,10 @@ def validate_package(package: Path) -> tuple[int, dict[str, Any]]:
         group_categories[group_id].add(record.get("content_category"))
         group_splits[group_id].add(record.get("split"))
         origin = record.get("origin_class")
-        validation.require(origin in {"camera", "synthetic"}, f"{sample_id}: bad origin")
+        validation.require(
+            origin in {"camera", "real_photo", "synthetic"},
+            f"{sample_id}: bad origin",
+        )
         expected = slot_by_id.get(slot_id, {})
         validation.require(
             origin == expected.get("origin_class"),
@@ -1609,6 +2073,15 @@ def validate_package(package: Path) -> tuple[int, dict[str, Any]]:
             validation.require(
                 record.get("generation") is None,
                 f"{sample_id}: camera generation must be null",
+            )
+        elif origin == "real_photo":
+            validation.require(
+                record.get("capture") is None,
+                f"{sample_id}: real_photo capture must be null",
+            )
+            validation.require(
+                record.get("generation") is None,
+                f"{sample_id}: real_photo generation must be null",
             )
         elif origin == "synthetic":
             generation = record.get("generation")
@@ -1811,6 +2284,225 @@ def validate_package(package: Path) -> tuple[int, dict[str, Any]]:
                         not leaking,
                         f"{sample_id}: normalized metadata remains: {sorted(leaking)}",
                     )
+    if real_photo_pipeline:
+        caption_design = contract.get("design", {}).get("captioning", {})
+        qa_design = contract.get("design", {}).get("automated_qa", {})
+        selection_design = contract.get("design", {}).get(
+            "generation_selection",
+            {},
+        )
+        receipts_by_group: dict[str, dict[str, dict[str, Any]]] = (
+            defaultdict(dict)
+        )
+        source_rows: set[tuple[str, str, str]] = set()
+        source_hashes: set[str] = set()
+        perceptual_hashes: list[tuple[str, str]] = []
+        for record in records:
+            sample_id = record.get("sample_id")
+            group_id = record.get("semantic_group_id")
+            relative = record.get("receipt_path")
+            if not isinstance(relative, str):
+                continue
+            try:
+                receipt = read_json(safe_path(package, relative))
+            except PipelineError as error:
+                validation.require(False, f"{sample_id}: {error}")
+                continue
+            receipts_by_group[group_id][record.get("origin_class")] = receipt
+            if record.get("origin_class") != "real_photo":
+                continue
+            lineage = receipt.get("lineage")
+            captioning = receipt.get("captioning")
+            qa = receipt.get("automated_qa")
+            source = receipt.get("real_source")
+            validation.require(
+                isinstance(source, dict),
+                f"{sample_id}: HF source lineage is missing",
+            )
+            if not isinstance(source, dict):
+                continue
+            for field, expected_value in (
+                ("dataset_id", real_source_design.get("dataset_id")),
+                ("dataset_revision", real_source_design.get("revision")),
+                ("source_split", real_source_design.get("split")),
+            ):
+                validation.require(
+                    source.get(field) == expected_value,
+                    f"{sample_id}: real_source.{field} differs from contract",
+                )
+            source_row_id = source.get("source_row_id")
+            source_key = (
+                str(source.get("dataset_id")),
+                str(source.get("dataset_revision")),
+                str(source_row_id),
+            )
+            validation.require(
+                bool(source_row_id) and source_key not in source_rows,
+                f"{sample_id}: HF source row is missing or reused",
+            )
+            source_rows.add(source_key)
+            validation.require(
+                isinstance(lineage, dict)
+                and lineage.get("source_photo_group_id") == group_id
+                and lineage.get("original_sha256")
+                == record.get("original_sha256")
+                and lineage.get("original_bytes")
+                == record.get("original_bytes"),
+                f"{sample_id}: source-photo lineage differs",
+            )
+            validation.require(
+                receipt.get("quarantine_status") == "accepted"
+                and receipt.get("manual_override_status") in {
+                    "none",
+                    "applied",
+                },
+                f"{sample_id}: source quarantine/override status is missing",
+            )
+            validation.require(
+                isinstance(captioning, dict)
+                and bool(captioning.get("raw_caption"))
+                and bool(captioning.get("normalized_caption"))
+                and captioning.get("caption_policy_version")
+                == caption_design.get("normalization_policy")
+                and captioning.get("model_id")
+                == caption_design.get("model_id")
+                and captioning.get("model_revision")
+                == caption_design.get("model_revision"),
+                f"{sample_id}: caption lineage differs from contract",
+            )
+            validation.require(
+                isinstance(qa, dict)
+                and qa.get("model_id") == qa_design.get("model_id")
+                and qa.get("model_revision")
+                == qa_design.get("model_revision"),
+                f"{sample_id}: QA lineage differs from contract",
+            )
+            digest = record.get("original_sha256")
+            validation.require(
+                isinstance(digest, str) and digest not in source_hashes,
+                f"{sample_id}: exact duplicate real photo",
+            )
+            if isinstance(digest, str):
+                source_hashes.add(digest)
+            health = receipt.get("image_health")
+            perceptual_hash = (
+                health.get("perceptual_hash")
+                if isinstance(health, dict)
+                else None
+            )
+            validation.require(
+                isinstance(perceptual_hash, str)
+                and bool(re.fullmatch(r"[0-9a-f]{16}", perceptual_hash)),
+                f"{sample_id}: perceptual hash is missing",
+            )
+            if isinstance(perceptual_hash, str):
+                max_distance = qa_design.get(
+                    "near_duplicate_hamming_distance",
+                    0,
+                )
+                near = next(
+                    (
+                        previous_group
+                        for previous_hash, previous_group in perceptual_hashes
+                        if (
+                            int(perceptual_hash, 16)
+                            ^ int(previous_hash, 16)
+                        ).bit_count()
+                        <= max_distance
+                    ),
+                    None,
+                )
+                validation.require(
+                    near is None,
+                    f"{sample_id}: perceptual near-duplicate of {near}",
+                )
+                perceptual_hashes.append((perceptual_hash, group_id))
+        for group_id, group_records in receipts_by_group.items():
+            real_receipt = group_records.get("real_photo")
+            if not isinstance(real_receipt, dict):
+                validation.require(
+                    False,
+                    f"{group_id}: real-photo receipt is missing",
+                )
+                continue
+            expected_lineage = real_receipt.get("lineage")
+            expected_captioning = real_receipt.get("captioning")
+            for record in (
+                item
+                for item in records
+                if item.get("semantic_group_id") == group_id
+                and item.get("origin_class") == "synthetic"
+            ):
+                receipt_path = record.get("receipt_path")
+                try:
+                    receipt = read_json(safe_path(package, receipt_path))
+                except (PipelineError, TypeError):
+                    continue
+                sample_id = record.get("sample_id")
+                validation.require(
+                    receipt.get("lineage") == expected_lineage,
+                    f"{sample_id}: source-photo lineage differs",
+                )
+                validation.require(
+                    receipt.get("captioning") == expected_captioning,
+                    f"{sample_id}: frozen caption lineage differs",
+                )
+                candidates = receipt.get("candidates")
+                selected_index = receipt.get("candidate_index")
+                passing = [
+                    candidate.get("candidate_index")
+                    for candidate in candidates
+                    if isinstance(candidate, dict)
+                    and candidate.get("passed") is True
+                ] if isinstance(candidates, list) else []
+                validation.require(
+                    receipt.get("selection_method")
+                    == selection_design.get("method")
+                    and len(candidates or [])
+                    == selection_design.get("candidates_per_slot")
+                    and bool(passing)
+                    and selected_index == passing[0],
+                    f"{sample_id}: automatic selection is not first-passing",
+                )
+                validation.require(
+                    receipt.get("quarantine_status") == "accepted"
+                    and receipt.get("manual_override_status") in {
+                        "none",
+                        "applied",
+                    },
+                    f"{sample_id}: quarantine/override status is missing",
+                )
+        quarantine_entries = contract.get("files", {}).get("quarantine", [])
+        validation.require(
+            isinstance(quarantine_entries, list),
+            "quarantine file index is invalid",
+        )
+        if isinstance(quarantine_entries, list):
+            for entry in quarantine_entries:
+                if not isinstance(entry, dict):
+                    validation.require(
+                        False,
+                        "quarantine file entry is invalid",
+                    )
+                    continue
+                try:
+                    quarantine_path = safe_path(package, entry.get("path"))
+                except (PipelineError, TypeError) as error:
+                    validation.require(False, str(error))
+                    continue
+                validation.require(
+                    quarantine_path.is_file()
+                    and quarantine_path.stat().st_size == entry.get("bytes")
+                    and sha256(quarantine_path) == entry.get("sha256"),
+                    f"invalid quarantine receipt: {entry.get('path')}",
+                )
+            validation.require(
+                len(quarantine_entries)
+                == contract.get("selection", {}).get(
+                    "quarantined_group_count"
+                ),
+                "quarantine receipt count differs from selection contract",
+            )
     for group_id in sorted(group_slots):
         validation.require(
             group_slots[group_id] == expected_slot_ids,
@@ -1848,8 +2540,12 @@ def validate_package(package: Path) -> tuple[int, dict[str, Any]]:
         and selection.get("method") == "all"
         and isinstance(target_group_count, int)
     ):
+        quarantined = selection.get("quarantined_group_count", 0)
         validation.require(
-            len(group_slots) >= target_group_count,
+            len(group_slots) + (
+                quarantined if isinstance(quarantined, int) else 0
+            )
+            >= target_group_count,
             "full package is below target_group_count",
         )
     expected_index = group_index_from_records(
