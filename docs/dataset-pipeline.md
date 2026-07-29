@@ -3,31 +3,37 @@
 ## What Build does
 
 `specs/v1.json` is the checked-in experiment contract. It contains all 200
-semantic groups, frozen prompts, group-locked splits, the seven-slot sample
-matrix, camera acquisition policy, and generator configurations.
+semantic groups, a versioned concept-to-prompt policy, group-locked splits, the
+seven-slot sample matrix, camera acquisition policy, generator configurations,
+and deterministic review policy.
 
 For the selected groups, Build runs this sequence:
 
 1. Validate the complete design before downloading inputs or model weights.
-2. Search Wikimedia Commons for semantically matched JPEGs.
-3. Require camera make, camera model, capture time, a compatible license, and
+2. Render one frozen natural-photograph prompt from each semantic concept.
+3. Search Wikimedia Commons for semantically matched JPEGs, preserving actions
+   and relationships in the first query.
+4. Require camera make, camera model, capture time, a compatible license, and
    no detected editor name in EXIF `Software`.
-4. Download each original photograph and record its source page, license,
+5. Download each original photograph and record its source page, license,
    search query, Commons identifier, EXIF, dimensions, and checksum.
-5. Reject duplicate camera records or bytes before local generation starts.
-6. Run the same frozen prompt through every configured local model slot.
-7. Cache the acquired and generated inputs with checksummed receipts.
-8. Retain byte-identical originals and create deterministic 512×512 RGB PNG
-   analysis versions with ImageMagick.
-9. Embed the normalized PNG bytes and explicitly typed sample metadata in
+6. Reject duplicate camera records or bytes before local generation starts.
+7. Generate the configured deterministic candidate pool for every synthetic
+   slot at the generator family's native resolution.
+8. Cache every candidate with a checksummed receipt and write a review manifest.
+9. Require an explicit first-passing decision for every synthetic slot.
+10. Retain byte-identical selected originals and create deterministic 512×512
+    RGB PNG analysis versions with ImageMagick.
+11. Embed the normalized PNG bytes and explicitly typed sample metadata in
    group-aligned Parquet shards.
-10. Validate the complete group matrix and write a local Hugging Face package.
+12. Validate the complete group matrix and write a local Hugging Face package.
 
-No separate cache-population step is required. The cache is an internal,
-reusable stage of Build. A prompt, slot, seed, or model-configuration change
-produces a different cache key; a matching entry is reused only when its
-SHA-256 checksum still matches its receipt. A cached-only rebuild neither
-loads a model nor runs inference.
+No separate cache-population step is required. The first real Build generates
+the candidates and then pauses if review decisions are missing. A prompt
+policy, slot, candidate index, seed, model revision, or model-configuration
+change produces a different cache key; a matching entry is reused only when
+its SHA-256 checksum still matches its receipt. The post-review Build reuses
+the candidate cache and does not run inference again.
 
 Build does **not** stream records directly into Hugging Face. It finishes and
 validates `.mai-data/package` locally first. Publish is a separate operation so
@@ -69,9 +75,11 @@ python3 -m mai.dataset_cli build \
 ```
 
 That selection covers three content categories and the complete planned axis:
-3 camera photographs plus 18 synthetic outputs, or 21 samples total. Dry run
-validates the selection and reports cache hits, camera downloads, and local
-generation jobs without accessing the network or writing files.
+3 camera photographs plus 18 selected synthetic outputs, or 21 samples total.
+The default four-candidate review policy plans 72 synthetic generation jobs.
+Dry run validates the selection and reports cache hits, camera downloads,
+candidate jobs, and pending review decisions without accessing the network or
+writing files.
 
 Run the same selection for real:
 
@@ -85,10 +93,32 @@ python3 -m mai.dataset_cli build \
   --group-id food-005
 ```
 
-The TUI exposes the same arguments through `python3 -m mai`; select `Build
-dataset`, choose exact groups in the popup, and run. The running screen shows
-each acquisition/generation cache hit or local job, then each normalization
-step.
+The first run finishes candidate generation and reports that review is
+required. Open `.mai-data/cache/review/candidates.json`; each entry maps a
+sample slot and candidate index to a cached PNG, seed, prompt, model revision,
+and checksum. Open `.mai-data/cache/review/index.html` for a visual candidate
+grid, then complete `.mai-data/cache/review/decisions.json`:
+
+```json
+{
+  "status": "accepted",
+  "candidate_index": 2,
+  "candidate_sha256": "<copy candidate 2 sha256 from candidates.json>",
+  "rejected_candidates": {
+    "0": ["semantic_mismatch"],
+    "1": ["non_photographic_style"]
+  },
+  "reviewer": "reviewer-id",
+  "reviewed_at": "2026-07-29T18:00:00Z"
+}
+```
+
+Every candidate before the accepted candidate must have one or more declared
+rejection reasons. `candidate_sha256` binds the decision to the exact reviewed
+bytes, so changing a prompt, model, setting, or candidate invalidates a stale
+decision. Run the same Build command again; it validates the decisions and
+packages the selected candidates from cache. The TUI exposes the same Build
+arguments through `python3 -m mai`.
 
 For the 200-group preliminary run, omit `--group-id`:
 
@@ -99,9 +129,12 @@ python3 -m mai.dataset_cli build \
   --cache .mai-data/cache
 ```
 
-The full v1 matrix is 1,400 images: one camera image plus two outputs from each
-of three generator families for every group. An unfiltered build fails if the
-spec contains fewer than `dataset.target_group_count` groups.
+The full v1 matrix is 1,400 selected images: one camera image plus two outputs
+from each of three generator families for every group. Its four-candidate
+policy requires reviewing up to 4,800 generated candidates. Calibrate and
+freeze the prompt and generator settings on a small, non-evaluation subset
+before starting that run. An unfiltered build fails if the spec contains fewer
+than `dataset.target_group_count` groups.
 
 ## Camera provenance and curation
 
@@ -140,7 +173,9 @@ reviewed source, add a `camera_source` object to that group:
 The direct adapter requires a JPEG, verifies its declared SHA-256 before use,
 and records the immutable URL and source metadata. For Wikimedia acquisition,
 `camera_source: {"query": "custom search terms"}` can override the query without
-changing adapters.
+changing adapters. `search_candidate_index` selects among the recorded
+license/EXIF-compatible results for exploratory builds; a release should use a
+pinned direct source because search rankings can change.
 
 Hybrid, image-to-image, edited, rephotographed, or otherwise ambiguous samples
 must not be marked `in_scope`. The initial validator accepts only
@@ -172,6 +207,8 @@ with published schema-`2.0.0` ImageFolder packages.
 | `license` | string | Dataset policy; each sample also records its own license. |
 | `target_group_count` | integer | Required count for an unfiltered build. |
 | `seed_base` | integer | Base for deterministic per-group, per-slot seeds. |
+| `prompt_policy` | object | Versioned `{concept}` template shared by all generators. |
+| `generation_review` | object | Candidate count, allowed rejection reasons, and explicit-decision policy. |
 | `expected_slots` | array | Complete sample matrix required in every group. |
 | `camera_acquisition` | object | Default camera adapter and settings. |
 | `generators` | object | Generator-family configurations keyed by family ID. |
@@ -189,15 +226,18 @@ groups” option.
 | `family_id` | ID | Must equal the key in `dataset.generators`. |
 | `adapter` | ID | `local-diffusers`. |
 | `model_id` | string | Hugging Face model repository identifier. |
-| `model_revision` | string | Optional requested revision; the resolved commit is recorded. |
+| `model_revision` | string | Requested immutable revision; required by explicit review. |
 | `device` | string | `auto`, `cpu`, `mps`, `cuda`, or an explicit CUDA device. |
 | `cpu_offload` | boolean | Use Diffusers model CPU offload on CUDA; default `true`. |
 | `settings` | object | Resolution, inference steps, guidance, and optional negative prompt. |
 | `output_terms_url` | URL | Terms governing generated outputs. |
 
-Every local slot receives a deterministic 31-bit seed derived from `seed_base`,
-group ID, and slot ID. The receipt records that seed, the resolved model
-repository commit, Diffusers pipeline class, execution device, and Torch dtype.
+Candidate zero receives the original deterministic 31-bit slot seed. Additional
+candidates derive independent seeds from `seed_base`, group ID, slot ID, and
+candidate index. The receipt records the selected candidate and rejected
+predecessors, resolved model commit, rendered prompt, prompt-template ID,
+Diffusers pipeline and scheduler configuration, runtime library versions,
+execution device, and Torch dtype.
 
 ### Group fields
 
@@ -206,7 +246,8 @@ repository commit, Diffusers pipeline class, execution device, and Torch dtype.
 | `semantic_group_id` | ID | Stable group identity. |
 | `content_category` | string | Controlled content stratum. |
 | `split` | ID | Group-locked train, validation, or test split. |
-| `prompt` | object | `prompt_id`, exact `text`, and `frozen: true`. |
+| `prompt` | object | Legacy frozen concept text and stable prompt ID. |
+| `concept` | object | Optional explicit concept; otherwise derived from `prompt`. |
 | `camera_source` | object | Optional query override or pinned direct source. |
 | `samples` | array | Optional legacy manual records; absent means on demand. |
 

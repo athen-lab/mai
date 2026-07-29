@@ -33,10 +33,12 @@ nix develop "path:$PWD"
 `Build dataset` is the first workbench operation. Its popup lets you select
 exact semantic groups from the build spec. Build downloads screened camera
 photographs and generates every synthetic counterpart on demand, caches those
-inputs, normalizes them, embeds the analysis images and typed metadata in
-Parquet shards, and validates the local package. Byte-identical originals and
-provenance receipts remain as audit sidecars. Synthetic images are generated
-locally with Diffusers—no paid image-generation API is configured.
+inputs, and writes a visual candidate grid. After explicit first-passing review,
+the same Build command reuses the cache, normalizes the selected images, embeds
+the analysis images and typed metadata in Parquet shards, and validates the
+local package. Byte-identical originals and provenance receipts remain as audit
+sidecars. Synthetic images are generated locally with Diffusers—no paid
+image-generation API is configured.
 The same path builds three groups for a smoke test or all 200 groups for the
 preliminary run.
 

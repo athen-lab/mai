@@ -1226,6 +1226,8 @@ def build_package(
                 "originals_are_immutable": True,
                 "analysis_unit": "normalized",
                 "seed_base": dataset_spec.get("seed_base"),
+                "prompt_policy": dataset_spec.get("prompt_policy"),
+                "generation_review": dataset_spec.get("generation_review"),
                 "camera_acquisition": dataset_spec.get("camera_acquisition"),
                 "generators": dataset_spec.get("generators"),
             },
@@ -1558,6 +1560,16 @@ def validate_package(package: Path) -> tuple[int, dict[str, Any]]:
     group_splits: dict[str, set[str]] = defaultdict(set)
     group_data_files: dict[str, set[str]] = defaultdict(set)
     families: set[str] = set()
+    review_design = contract.get("design", {}).get("generation_review", {})
+    review_required = (
+        isinstance(review_design, dict)
+        and review_design.get("require_explicit_decision") is True
+    )
+    review_method = (
+        review_design.get("selection_method")
+        if isinstance(review_design, dict)
+        else None
+    )
     for record in records:
         sample_id = record.get("sample_id", "<missing>")
         validation.require(
@@ -1611,6 +1623,44 @@ def validate_package(package: Path) -> tuple[int, dict[str, Any]]:
                 validation.require(
                     family == expected.get("generator_family"),
                     f"{sample_id}: generator family differs from slot",
+                )
+                if review_required:
+                    configured_candidates = review_design.get(
+                        "candidates_per_slot"
+                    )
+                    validation.require(
+                        isinstance(generation.get("candidate_index"), int)
+                        and isinstance(generation.get("candidate_count"), int),
+                        f"{sample_id}: reviewed candidate metadata is missing",
+                    )
+                    validation.require(
+                        generation.get("candidate_count")
+                        == configured_candidates
+                        and 0
+                        <= generation.get("candidate_index", -1)
+                        < generation.get("candidate_count", 0),
+                        f"{sample_id}: reviewed candidate metadata differs "
+                        "from contract",
+                    )
+            if review_required:
+                audit = record.get("audit")
+                validation.require(
+                    isinstance(audit, dict)
+                    and audit.get("review_status") == "accepted",
+                    f"{sample_id}: explicit generation review is missing",
+                )
+                validation.require(
+                    isinstance(audit, dict)
+                    and audit.get("selection_method") == review_method,
+                    f"{sample_id}: generation review method differs from contract",
+                )
+                validation.require(
+                    isinstance(audit, dict)
+                    and isinstance(audit.get("reviewer"), str)
+                    and bool(audit["reviewer"])
+                    and isinstance(audit.get("reviewed_at"), str)
+                    and bool(audit["reviewed_at"]),
+                    f"{sample_id}: generation reviewer metadata is missing",
                 )
         scope = record.get("scope")
         validation.require(
@@ -1839,10 +1889,24 @@ def initialize_spec(path: Path, *, force: bool = False) -> None:
             "license": "mixed-per-sample",
             "target_group_count": 200,
             "seed_base": 1729,
+            "prompt_policy": {
+                "template_id": "natural-photo-v2",
+                "template": (
+                    "A natural photograph depicting {concept}. Realistic "
+                    "lighting, materials, textures, and ordinary photographic "
+                    "composition."
+                ),
+            },
+            "generation_review": {
+                "candidates_per_slot": 1,
+                "require_explicit_decision": False,
+                "selection_method": "first-candidate-v1",
+            },
             "camera_acquisition": {
                 "adapter": "wikimedia-commons",
                 "api_url": "https://commons.wikimedia.org/w/api.php",
                 "search_limit": 40,
+                "candidate_limit": 8,
                 "require_camera_exif": True,
                 "reject_detected_editors": True,
             },
@@ -1853,10 +1917,11 @@ def initialize_spec(path: Path, *, force: bool = False) -> None:
                     "model_id": "black-forest-labs/FLUX.1-schnell",
                     "device": "auto",
                     "settings": {
-                        "width": 512,
-                        "height": 512,
+                        "width": 1024,
+                        "height": 1024,
                         "num_inference_steps": 4,
                         "guidance_scale": 0.0,
+                        "max_sequence_length": 256,
                     },
                     "output_terms_url": (
                         "https://huggingface.co/black-forest-labs/"
@@ -1869,10 +1934,15 @@ def initialize_spec(path: Path, *, force: bool = False) -> None:
                     "model_id": "stabilityai/stable-diffusion-xl-base-1.0",
                     "device": "auto",
                     "settings": {
-                        "width": 512,
-                        "height": 512,
+                        "width": 1024,
+                        "height": 1024,
                         "num_inference_steps": 30,
-                        "guidance_scale": 7.0,
+                        "guidance_scale": 6.0,
+                        "negative_prompt": (
+                            "illustration, drawing, painting, cartoon, CGI, "
+                            "3D render, graphic design, collage, border, frame, "
+                            "watermark"
+                        ),
                     },
                     "output_terms_url": (
                         "https://huggingface.co/stabilityai/"
@@ -1890,7 +1960,12 @@ def initialize_spec(path: Path, *, force: bool = False) -> None:
                         "width": 512,
                         "height": 512,
                         "num_inference_steps": 30,
-                        "guidance_scale": 7.5,
+                        "guidance_scale": 7.0,
+                        "negative_prompt": (
+                            "illustration, drawing, painting, cartoon, CGI, "
+                            "3D render, graphic design, collage, border, frame, "
+                            "watermark"
+                        ),
                     },
                     "output_terms_url": (
                         "https://huggingface.co/stable-diffusion-v1-5/"

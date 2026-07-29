@@ -223,6 +223,44 @@ class DatasetPipelineTests(unittest.TestCase):
         status, validation = validate_package(self.package)
         self.assertEqual(status, 0, validation)
 
+    def test_explicit_review_contract_requires_accepted_candidates(self) -> None:
+        spec = read_json(self.spec)
+        spec["dataset"]["generation_review"] = {
+            "candidates_per_slot": 2,
+            "require_explicit_decision": True,
+            "selection_method": "explicit-first-passing-v1",
+        }
+        write_json(self.spec, spec)
+        with self.assertRaisesRegex(
+            PipelineError,
+            "explicit generation review is missing",
+        ):
+            build_package(self.spec, self.package)
+
+    def test_explicit_review_metadata_builds_valid_package(self) -> None:
+        spec = read_json(self.spec)
+        spec["dataset"]["generation_review"] = {
+            "candidates_per_slot": 2,
+            "require_explicit_decision": True,
+            "selection_method": "explicit-first-passing-v1",
+        }
+        for sample in spec["samples"]:
+            if sample["origin_class"] != "synthetic":
+                continue
+            sample["generation"]["candidate_index"] = 0
+            sample["generation"]["candidate_count"] = 2
+            sample["audit"] = {
+                "selection_method": "explicit-first-passing-v1",
+                "review_status": "accepted",
+                "candidate_index": 0,
+                "candidate_count": 2,
+                "reviewer": "test-reviewer",
+                "reviewed_at": "2026-01-01T00:00:00Z",
+            }
+        write_json(self.spec, spec)
+        report = build_package(self.spec, self.package)
+        self.assertEqual(report["status"], "pass")
+
     def test_build_can_select_exact_groups(self) -> None:
         report = build_package(
             self.spec,
