@@ -5,6 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 import gc
 import hashlib
+from html import escape
+from importlib.metadata import PackageNotFoundError, version
 import json
 import os
 from pathlib import Path
@@ -24,7 +26,7 @@ from .dataset import (
 )
 
 
-USER_AGENT = "mai-research/0.2 (+https://github.com/kenneth/mai)"
+USER_AGENT = "mai-research/0.3 (+https://github.com/kenneth/mai)"
 MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 JPEG_SIGNATURE = b"\xff\xd8\xff"
 REJECTED_EDITORS = (
@@ -84,6 +86,15 @@ SEARCH_STOPWORDS = {
     "winding",
     "with",
 }
+QUERY_SCAFFOLDING = {"a", "an", "of", "the"}
+DEFAULT_REJECTION_REASONS = {
+    "border_or_collage",
+    "corrupt_or_blank",
+    "literal_prompt_scaffolding",
+    "non_photographic_style",
+    "semantic_mismatch",
+    "watermark",
+}
 
 CameraFetcher = Callable[
     [dict[str, Any], dict[str, Any], Path],
@@ -93,6 +104,137 @@ GeneratorRunner = Callable[
     [dict[str, Any], dict[str, Any], int | None, Path],
     dict[str, Any],
 ]
+
+
+def _package_version(name: str) -> str | None:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return None
+
+
+def _concept_text(group: dict[str, Any]) -> str:
+    concept = group.get("concept")
+    if isinstance(concept, dict):
+        value = concept.get("text")
+        if isinstance(value, str) and value.strip():
+            return value.strip().rstrip(".")
+    prompt = group.get("prompt")
+    text = prompt.get("text") if isinstance(prompt, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        raise PipelineError(
+            f"{group.get('semantic_group_id', '<unknown>')}: "
+            "a concept or prompt text is required"
+        )
+    return re.sub(
+        r"^\s*a camera photograph of\s+",
+        "",
+        text.strip(),
+        flags=re.IGNORECASE,
+    ).rstrip(".")
+
+
+def _materialize_group(
+    dataset: dict[str, Any],
+    group: dict[str, Any],
+) -> dict[str, Any]:
+    prepared = deepcopy(group)
+    concept_text = _concept_text(group)
+    concept = group.get("concept")
+    if isinstance(concept, dict):
+        concept_record = deepcopy(concept)
+    else:
+        prompt = group.get("prompt", {})
+        prompt_id = (
+            prompt.get("prompt_id")
+            if isinstance(prompt, dict)
+            else None
+        )
+        concept_record = {
+            "concept_id": prompt_id,
+            "text": concept_text,
+            "frozen": True,
+        }
+    prepared["concept"] = concept_record
+
+    policy = dataset.get("prompt_policy")
+    if policy is None:
+        return prepared
+    if not isinstance(policy, dict):
+        raise PipelineError("dataset.prompt_policy must be an object")
+    template_id = policy.get("template_id")
+    template = policy.get("template")
+    if not isinstance(template_id, str) or not template_id:
+        raise PipelineError("dataset.prompt_policy.template_id is required")
+    if not isinstance(template, str) or "{concept}" not in template:
+        raise PipelineError(
+            "dataset.prompt_policy.template must contain {concept}"
+        )
+    try:
+        rendered = template.format(concept=concept_text).strip()
+    except (KeyError, ValueError) as error:
+        raise PipelineError(
+            f"invalid dataset.prompt_policy.template: {error}"
+        ) from error
+    prompt = group.get("prompt")
+    if not isinstance(prompt, dict):
+        raise PipelineError(
+            f"{group.get('semantic_group_id')}: prompt object is required"
+        )
+    prepared["prompt"] = {
+        "prompt_id": prompt.get("prompt_id"),
+        "text": rendered,
+        "frozen": True,
+    }
+    prepared["prompt_policy"] = {
+        "template_id": template_id,
+        "template": template,
+    }
+    return prepared
+
+
+def _review_policy(dataset: dict[str, Any]) -> dict[str, Any]:
+    configured = dataset.get("generation_review", {})
+    if not isinstance(configured, dict):
+        raise PipelineError("dataset.generation_review must be an object")
+    candidate_count = configured.get("candidates_per_slot", 1)
+    if not isinstance(candidate_count, int) or not 1 <= candidate_count <= 16:
+        raise PipelineError(
+            "dataset.generation_review.candidates_per_slot must be 1..16"
+        )
+    require_explicit = configured.get("require_explicit_decision", False)
+    if not isinstance(require_explicit, bool):
+        raise PipelineError(
+            "dataset.generation_review.require_explicit_decision must be boolean"
+        )
+    method = configured.get(
+        "selection_method",
+        "explicit-first-passing-v1" if require_explicit else "first-candidate-v1",
+    )
+    if not isinstance(method, str) or not method:
+        raise PipelineError(
+            "dataset.generation_review.selection_method is required"
+        )
+    reasons = configured.get(
+        "allowed_rejection_reasons",
+        sorted(DEFAULT_REJECTION_REASONS),
+    )
+    if (
+        not isinstance(reasons, list)
+        or not reasons
+        or not all(isinstance(reason, str) and reason for reason in reasons)
+    ):
+        raise PipelineError(
+            "dataset.generation_review.allowed_rejection_reasons "
+            "must be a non-empty string array"
+        )
+    return {
+        **configured,
+        "candidates_per_slot": candidate_count,
+        "require_explicit_decision": require_explicit,
+        "selection_method": method,
+        "allowed_rejection_reasons": reasons,
+    }
 
 
 def _json_key(value: Any) -> str:
@@ -268,23 +410,21 @@ def _commons_candidate(page: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _camera_search_queries(group: dict[str, Any]) -> list[str]:
-    prompt = group["prompt"]["text"]
     configured = group.get("camera_source", {}).get("query")
     raw = (
         configured
         if isinstance(configured, str) and configured.strip()
-        else re.sub(
-            r"^\s*a camera photograph of\s+",
-            "",
-            prompt,
-            flags=re.IGNORECASE,
-        ).rstrip(".")
+        else _concept_text(group)
     )
     tokens = re.findall(r"[a-z0-9]+(?:[-'][a-z0-9]+)*", raw.casefold())
+    semantic = [token for token in tokens if token not in QUERY_SCAFFOLDING]
     filtered = [token for token in tokens if token not in SEARCH_STOPWORDS]
     if not filtered:
         filtered = tokens
-    queries: list[str] = []
+    queries = [" ".join(semantic)] if semantic else []
+    compact = " ".join(filtered)
+    if compact and compact not in queries:
+        queries.append(compact)
     for length in (len(filtered), 6, 5, 4, 3, 2):
         if length > len(filtered) or length < 1:
             continue
@@ -306,8 +446,11 @@ def fetch_wikimedia_camera(
         )
     )
     queries = _camera_search_queries(group)
-    candidate = None
-    selected_query = None
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    seen_pages: set[str] = set()
+    candidate_limit = config.get("candidate_limit", 8)
+    if not isinstance(candidate_limit, int) or not 1 <= candidate_limit <= 40:
+        raise PipelineError("camera candidate_limit must be 1..40")
     for query in queries:
         params = {
             "action": "query",
@@ -325,25 +468,36 @@ def fetch_wikimedia_camera(
         pages = response.get("query", {}).get("pages", [])
         if not isinstance(pages, list):
             pages = []
-        candidate = next(
-            (
-                accepted
-                for page in pages
-                if isinstance(page, dict)
-                for accepted in [_commons_candidate(page)]
-                if accepted is not None
-            ),
-            None,
-        )
-        if candidate is not None:
-            selected_query = query
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            accepted = _commons_candidate(page)
+            page_id = str(page.get("pageid"))
+            if accepted is None or page_id in seen_pages:
+                continue
+            candidates.append((query, accepted))
+            seen_pages.add(page_id)
+            if len(candidates) >= candidate_limit:
+                break
+        if candidates:
             break
-    if candidate is None:
+    if not candidates:
         raise PipelineError(
             f"{group['semantic_group_id']}: Wikimedia search returned no "
             "license-compatible JPEG with camera EXIF and no detected editor; "
             f"queries={queries}"
         )
+    selected_index = config.get("search_candidate_index", 0)
+    if (
+        not isinstance(selected_index, int)
+        or selected_index < 0
+        or selected_index >= len(candidates)
+    ):
+        raise PipelineError(
+            f"{group['semantic_group_id']}: camera search_candidate_index "
+            f"{selected_index!r} is outside 0..{len(candidates) - 1}"
+        )
+    selected_query, candidate = candidates[selected_index]
     page = candidate["page"]
     info = candidate["info"]
     _download(info["url"], target)
@@ -359,12 +513,27 @@ def fetch_wikimedia_camera(
         "source_record_id": page_id,
         "landing_page_url": landing_page,
         "license": candidate["license"],
+        "creator": candidate["extended"].get("Artist"),
+        "credit": candidate["extended"].get("Credit"),
     }
     provenance = {
         "kind": "wikimedia-commons-acquisition",
         "acquired_at": utc_now(),
         "query": selected_query,
         "attempted_queries": queries,
+        "candidate_count": len(candidates),
+        "selected_candidate_index": selected_index,
+        "candidates": [
+            {
+                "candidate_index": index,
+                "page_id": str(item["page"].get("pageid")),
+                "query": query,
+                "title": item["page"].get("title"),
+                "width": item["info"].get("width"),
+                "height": item["info"].get("height"),
+            }
+            for index, (query, item) in enumerate(candidates)
+        ],
         "page_id": page_id,
         "title": page.get("title"),
         "original_url": info["url"],
@@ -382,8 +551,10 @@ def fetch_wikimedia_camera(
         "generation": None,
         "scope": {"in_scope": True, "ambiguity_flags": []},
         "audit": {
-            "selection_method": "wikimedia-search-first-camera-exif-v1",
+            "selection_method": "wikimedia-search-camera-exif-v2",
             "automated_edit_screen": True,
+            "candidate_index": selected_index,
+            "candidate_count": len(candidates),
         },
         "provenance": provenance,
     }
@@ -425,6 +596,8 @@ def fetch_direct_camera(
             "source_record_id": source_config["source_record_id"],
             "landing_page_url": source_config["landing_page_url"],
             "license": source_config["license"],
+            "creator": source_config.get("creator"),
+            "credit": source_config.get("credit"),
         },
         "capture": capture,
         "generation": None,
@@ -568,6 +741,14 @@ def run_local_diffusers(
         }
     }
     generator = torch.Generator(device="cpu").manual_seed(seed)
+    scheduler = getattr(pipeline, "scheduler", None)
+    scheduler_config = getattr(scheduler, "config", {})
+    try:
+        scheduler_config = json.loads(
+            json.dumps(dict(scheduler_config), default=str)
+        )
+    except (TypeError, ValueError):
+        scheduler_config = {"value": str(scheduler_config)}
     try:
         result = pipeline(
             group["prompt"]["text"],
@@ -593,19 +774,38 @@ def run_local_diffusers(
             "input_image_used": False,
             "seed_status": "recorded",
             "seed": seed,
+            "rendered_prompt": group["prompt"]["text"],
+            "prompt_template_id": group.get("prompt_policy", {}).get(
+                "template_id"
+            ),
         },
-        "scope": {"in_scope": True, "ambiguity_flags": []},
-        "audit": {},
+        "scope": {
+            "in_scope": False,
+            "ambiguity_flags": ["pending-review"],
+        },
+        "audit": {"review_status": "pending"},
         "provenance": {
             "kind": "local-diffusers-generation",
             "generated_at": utc_now(),
             "execution_device": device,
             "torch_dtype": str(dtype),
             "pipeline_class": type(pipeline).__name__,
+            "scheduler_class": (
+                type(scheduler).__name__ if scheduler is not None else None
+            ),
+            "scheduler_config": scheduler_config,
             "model": model_id,
             "model_revision": model_revision,
             "prompt": group["prompt"],
+            "concept": group.get("concept"),
+            "prompt_policy": group.get("prompt_policy"),
             "settings": {**settings, "seed": seed},
+            "runtime": {
+                "diffusers": _package_version("diffusers"),
+                "huggingface_hub": _package_version("huggingface-hub"),
+                "torch": getattr(torch, "__version__", None),
+                "transformers": _package_version("transformers"),
+            },
         },
     }
 
@@ -615,6 +815,215 @@ def _seed(seed_base: int, group_id: str, slot_id: str) -> int:
         f"{seed_base}:{group_id}:{slot_id}".encode("utf-8")
     ).digest()
     return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+
+
+def _candidate_seed(
+    seed_base: int,
+    group_id: str,
+    slot_id: str,
+    candidate_index: int,
+) -> int:
+    if candidate_index == 0:
+        return _seed(seed_base, group_id, slot_id)
+    return _seed(
+        seed_base,
+        group_id,
+        f"{slot_id}-candidate-{candidate_index}",
+    )
+
+
+def _review_paths(cache_dir: Path) -> tuple[Path, Path]:
+    review_dir = cache_dir / "review"
+    return review_dir / "candidates.json", review_dir / "decisions.json"
+
+
+def _load_review_decisions(cache_dir: Path) -> dict[str, Any]:
+    _, decisions_path = _review_paths(cache_dir)
+    if not decisions_path.is_file():
+        return {}
+    document = read_json(decisions_path)
+    decisions = document.get("decisions")
+    if not isinstance(decisions, dict):
+        raise PipelineError(
+            f"{decisions_path}: decisions must be an object"
+        )
+    return decisions
+
+
+def _review_decision(
+    sample_id: str,
+    candidates: list[dict[str, Any]],
+    policy: dict[str, Any],
+    decisions: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    decision = decisions.get(sample_id)
+    if (
+        not policy["require_explicit_decision"]
+        and (
+            decision is None
+            or (
+                isinstance(decision, dict)
+                and decision.get("status") == "pending"
+            )
+        )
+    ):
+        decision = {
+            "status": "accepted",
+            "candidate_index": 0,
+            "rejected_candidates": {},
+            "reviewer": None,
+            "reviewed_at": None,
+        }
+    if not isinstance(decision, dict):
+        return None
+    if decision.get("status") != "accepted":
+        return None
+    selected_index = decision.get("candidate_index")
+    if (
+        not isinstance(selected_index, int)
+        or selected_index < 0
+        or selected_index >= len(candidates)
+    ):
+        raise PipelineError(
+            f"{sample_id}: review candidate_index must be within "
+            f"0..{len(candidates) - 1}"
+        )
+    rejected = decision.get("rejected_candidates", {})
+    if not isinstance(rejected, dict):
+        raise PipelineError(
+            f"{sample_id}: rejected_candidates must be an object"
+        )
+    if policy["require_explicit_decision"]:
+        for field in ("reviewer", "reviewed_at"):
+            if not isinstance(decision.get(field), str) or not decision[field]:
+                raise PipelineError(
+                    f"{sample_id}: explicit review requires {field}"
+                )
+        selected_sha256 = decision.get("candidate_sha256")
+        if selected_sha256 != candidates[selected_index]["sha256"]:
+            raise PipelineError(
+                f"{sample_id}: candidate_sha256 does not match candidate "
+                f"{selected_index}; review the current candidate bytes"
+            )
+    for raw_index in rejected:
+        try:
+            rejected_index = int(raw_index)
+        except (TypeError, ValueError) as error:
+            raise PipelineError(
+                f"{sample_id}: rejected candidate keys must be integers"
+            ) from error
+        if str(rejected_index) != raw_index or not 0 <= rejected_index < selected_index:
+            raise PipelineError(
+                f"{sample_id}: rejected candidate {raw_index!r} does not "
+                "precede the accepted candidate"
+            )
+    allowed = set(policy["allowed_rejection_reasons"])
+    for index in range(selected_index):
+        reasons = rejected.get(str(index))
+        if (
+            not isinstance(reasons, list)
+            or not reasons
+            or not all(isinstance(reason, str) for reason in reasons)
+        ):
+            raise PipelineError(
+                f"{sample_id}: candidate {index} must have rejection reasons "
+                "before a later candidate can be accepted"
+            )
+        unknown = sorted(set(reasons) - allowed)
+        if unknown:
+            raise PipelineError(
+                f"{sample_id}: candidate {index} has unknown rejection "
+                f"reasons: {', '.join(unknown)}"
+            )
+    return candidates[selected_index], deepcopy(decision)
+
+
+def _write_review_documents(
+    cache_dir: Path,
+    policy: dict[str, Any],
+    candidates: dict[str, list[dict[str, Any]]],
+    decisions: dict[str, Any],
+) -> tuple[Path, Path]:
+    candidates_path, decisions_path = _review_paths(cache_dir)
+    write_json(
+        candidates_path,
+        {
+            "schema_version": "1.0.0",
+            "selection_method": policy["selection_method"],
+            "allowed_rejection_reasons": policy["allowed_rejection_reasons"],
+            "candidates": candidates,
+        },
+    )
+    scaffold = deepcopy(decisions)
+    for sample_id in candidates:
+        scaffold.setdefault(
+            sample_id,
+            {
+                "status": (
+                    "pending"
+                    if policy["require_explicit_decision"]
+                    else "accepted"
+                ),
+                "candidate_index": (
+                    None if policy["require_explicit_decision"] else 0
+                ),
+                "candidate_sha256": None,
+                "rejected_candidates": {},
+                "reviewer": None,
+                "reviewed_at": None,
+            },
+        )
+    write_json(
+        decisions_path,
+        {
+            "schema_version": "1.0.0",
+            "selection_method": policy["selection_method"],
+            "decisions": scaffold,
+        },
+    )
+    sections: list[str] = []
+    for sample_id, sample_candidates in sorted(candidates.items()):
+        cards = []
+        for candidate in sample_candidates:
+            relative_image = "../" + candidate["path"]
+            cards.append(
+                "<figure>"
+                f'<img src="{escape(relative_image)}" '
+                'loading="lazy" width="256" height="256">'
+                f"<figcaption>candidate {candidate['candidate_index']} · "
+                f"seed {candidate['seed']}</figcaption>"
+                "</figure>"
+            )
+        prompt = (
+            sample_candidates[0].get("prompt", "")
+            if sample_candidates
+            else ""
+        )
+        sections.append(
+            f"<section><h2>{escape(sample_id)}</h2>"
+            f"<p>{escape(str(prompt))}</p>"
+            f'<div class="candidates">{"".join(cards)}</div></section>'
+        )
+    review_html = candidates_path.with_name("index.html")
+    temporary = review_html.with_name(f".{review_html.name}.tmp")
+    temporary.write_text(
+        (
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            "<title>MAI generation review</title><style>"
+            "body{font:14px system-ui;margin:2rem;background:#111;color:#eee}"
+            "section{margin-bottom:2rem}.candidates{display:flex;gap:1rem;"
+            "flex-wrap:wrap}figure{margin:0;background:#222;padding:.6rem}"
+            "img{object-fit:contain;background:#000;display:block}"
+            "figcaption{margin-top:.5rem}</style></head><body>"
+            "<h1>MAI generation candidates</h1>"
+            "<p>Record decisions in <code>decisions.json</code>.</p>"
+            + "".join(sections)
+            + "</body></html>"
+        ),
+        encoding="utf-8",
+    )
+    os.replace(temporary, review_html)
+    return candidates_path, decisions_path
 
 
 def _cache_entry_valid(
@@ -644,6 +1053,16 @@ def preparation_plan(
     cache_dir: Path | None = None,
 ) -> dict[str, Any]:
     dataset, _, _, _ = validate_dataset_design(spec)
+    prepared_groups = [
+        _materialize_group(dataset, group) for group in groups
+    ]
+    review_policy = _review_policy(dataset)
+    candidate_count = review_policy["candidates_per_slot"]
+    review_decisions = (
+        _load_review_decisions(cache_dir)
+        if cache_dir is not None
+        else {}
+    )
     expected_slots = dataset.get("expected_slots", [])
     synthetic_slots = [
         slot for slot in expected_slots
@@ -663,6 +1082,14 @@ def preparation_plan(
         for field in ("adapter", "model_id", "settings", "output_terms_url"):
             if config.get(field) in (None, ""):
                 raise PipelineError(f"{family}.{field} is required")
+        if (
+            review_policy["require_explicit_decision"]
+            and not config.get("model_revision")
+        ):
+            raise PipelineError(
+                f"{family}.model_revision is required when explicit "
+                "generation review is enabled"
+            )
         credential = config.get("credential_env")
         if isinstance(credential, str) and credential:
             configured_credentials.add(credential)
@@ -674,7 +1101,8 @@ def preparation_plan(
     camera_downloads = 0
     generation_jobs = 0
     required_credentials: set[str] = set()
-    for group in groups:
+    review_decisions_pending = 0
+    for group in prepared_groups:
         for slot in expected_slots:
             if slot["origin_class"] == "camera":
                 source_config = {
@@ -696,25 +1124,46 @@ def preparation_plan(
             else:
                 family = slot["generator_family"]
                 generator_config = generators[family]
-                adapter = generator_config["adapter"]
-                seed = _seed(
-                    seed_base,
-                    group["semantic_group_id"],
-                    slot["slot_id"],
+                for candidate_index in range(candidate_count):
+                    seed = _candidate_seed(
+                        seed_base,
+                        group["semantic_group_id"],
+                        slot["slot_id"],
+                        candidate_index,
+                    )
+                    cache_key = _json_key({
+                        "kind": "synthetic",
+                        "group": group,
+                        "slot": slot,
+                        "config": generator_config,
+                        "candidate_index": candidate_index,
+                        "seed": seed,
+                    })
+                    cached = _cache_entry_valid(
+                        cache_dir,
+                        cache_key,
+                        ".png",
+                    )
+                    if not cached:
+                        generation_jobs += 1
+                        credential = generator_config.get("credential_env")
+                        if isinstance(credential, str) and credential:
+                            required_credentials.add(credential)
+                    else:
+                        cache_hits += 1
+                sample_id = (
+                    f"{group['semantic_group_id']}-{slot['slot_id']}"
                 )
-                cache_key = _json_key({
-                    "kind": "synthetic",
-                    "group": group,
-                    "slot": slot,
-                    "config": generator_config,
-                    "seed": seed,
-                })
-                cached = _cache_entry_valid(cache_dir, cache_key, ".png")
-                if not cached:
-                    generation_jobs += 1
-                    credential = generator_config.get("credential_env")
-                    if isinstance(credential, str) and credential:
-                        required_credentials.add(credential)
+                decision = review_decisions.get(sample_id)
+                if (
+                    review_policy["require_explicit_decision"]
+                    and (
+                        not isinstance(decision, dict)
+                        or decision.get("status") != "accepted"
+                    )
+                ):
+                    review_decisions_pending += 1
+                continue
             if cached:
                 cache_hits += 1
     return {
@@ -723,6 +1172,11 @@ def preparation_plan(
         "cache_hits": cache_hits,
         "camera_downloads": camera_downloads,
         "generation_jobs": generation_jobs,
+        "generation_candidate_count": (
+            len(prepared_groups) * len(synthetic_slots) * candidate_count
+        ),
+        "generation_candidates_per_slot": candidate_count,
+        "review_decisions_pending": review_decisions_pending,
         "configured_credentials": sorted(configured_credentials),
         "required_credentials": sorted(required_credentials),
         "missing_credentials": sorted(
@@ -782,6 +1236,7 @@ def prepare_groups(
             + ", ".join(plan["missing_credentials"])
         )
     dataset = spec["dataset"]
+    groups = [_materialize_group(dataset, group) for group in groups]
     expected_slots = dataset["expected_slots"]
     generators = dataset["generators"]
     acquisition = dataset["camera_acquisition"]
@@ -793,9 +1248,15 @@ def prepare_groups(
         "local-diffusers": run_local_diffusers,
     }
     seed_base = int(dataset.get("seed_base", 1729))
+    review_policy = _review_policy(dataset)
+    candidate_count = review_policy["candidates_per_slot"]
+    review_decisions = _load_review_decisions(cache_dir)
+    review_candidates: dict[str, list[dict[str, Any]]] = {}
+    pending_review: list[str] = []
     samples: list[dict[str, Any]] = []
     operation_count = plan["sample_count"]
     operation = 0
+    generated_candidate = 0
 
     def append_sample(
         group: dict[str, Any],
@@ -900,33 +1361,112 @@ def prepare_groups(
                 runner = generator_runners.get(adapter)
                 if runner is None:
                     raise PipelineError(f"unknown generator adapter: {adapter}")
-                seed = _seed(seed_base, group_id, slot_id)
-                cache_key = _json_key({
-                    "kind": "synthetic",
-                    "group": group,
-                    "slot": slot,
-                    "config": generator_config,
-                    "seed": seed,
-                })
-                if not _cache_entry_valid(cache_dir, cache_key, ".png"):
-                    print(
-                        f"[generate {operation + 1}/{operation_count}] "
-                        f"{group_id}-{slot_id} locally with "
-                        f"{generator_config['model_id']}",
-                        flush=True,
-                    )
-                fields = _cached_sample(
-                    cache_dir,
-                    cache_key,
-                    ".png",
-                    lambda target: runner(
-                        group,
-                        generator_config,
-                        seed,
-                        target,
-                    ),
-                )
                 sample_id = f"{group_id}-{slot_id}"
+                candidates: list[dict[str, Any]] = []
+                candidate_fields: list[dict[str, Any]] = []
+                for candidate_index in range(candidate_count):
+                    seed = _candidate_seed(
+                        seed_base,
+                        group_id,
+                        slot_id,
+                        candidate_index,
+                    )
+                    cache_key = _json_key({
+                        "kind": "synthetic",
+                        "group": group,
+                        "slot": slot,
+                        "config": generator_config,
+                        "candidate_index": candidate_index,
+                        "seed": seed,
+                    })
+                    generated_candidate += 1
+                    if not _cache_entry_valid(cache_dir, cache_key, ".png"):
+                        print(
+                            f"[generate {generated_candidate}/"
+                            f"{plan['generation_candidate_count']}] "
+                            f"{sample_id} candidate {candidate_index} locally "
+                            f"with {generator_config['model_id']}",
+                            flush=True,
+                        )
+                    fields = _cached_sample(
+                        cache_dir,
+                        cache_key,
+                        ".png",
+                        lambda target, candidate_seed=seed: runner(
+                            group,
+                            generator_config,
+                            candidate_seed,
+                            target,
+                        ),
+                    )
+                    candidate_fields.append(fields)
+                    candidate_path = Path(fields["input_path"])
+                    candidates.append(
+                        {
+                            "candidate_index": candidate_index,
+                            "seed": seed,
+                            "path": candidate_path.relative_to(
+                                cache_dir
+                            ).as_posix(),
+                            "sha256": sha256(candidate_path),
+                            "bytes": candidate_path.stat().st_size,
+                            "prompt": group["prompt"]["text"],
+                            "prompt_template_id": group.get(
+                                "prompt_policy", {}
+                            ).get("template_id"),
+                            "model_id": generator_config["model_id"],
+                            "model_revision": fields.get(
+                                "generation", {}
+                            ).get("model_revision"),
+                        }
+                    )
+                review_candidates[sample_id] = candidates
+                selected = _review_decision(
+                    sample_id,
+                    candidates,
+                    review_policy,
+                    review_decisions,
+                )
+                if selected is None:
+                    pending_review.append(sample_id)
+                    continue
+                selected_candidate, decision = selected
+                selected_index = selected_candidate["candidate_index"]
+                fields = candidate_fields[selected_index]
+                fields["scope"] = {
+                    "in_scope": True,
+                    "ambiguity_flags": [],
+                }
+                fields.setdefault("generation", {}).update(
+                    {
+                        "candidate_index": selected_index,
+                        "candidate_count": candidate_count,
+                        "rendered_prompt": group["prompt"]["text"],
+                        "prompt_template_id": group.get(
+                            "prompt_policy", {}
+                        ).get("template_id"),
+                    }
+                )
+                fields.setdefault("audit", {}).update(
+                    {
+                        "selection_method": review_policy["selection_method"],
+                        "review_status": "accepted",
+                        "reviewer": decision.get("reviewer"),
+                        "reviewed_at": decision.get("reviewed_at"),
+                        "candidate_index": selected_index,
+                        "candidate_count": candidate_count,
+                        "rejected_candidates": decision.get(
+                            "rejected_candidates", {}
+                        ),
+                    }
+                )
+                fields.setdefault("provenance", {}).update(
+                    {
+                        "candidate_index": selected_index,
+                        "candidate_count": candidate_count,
+                        "review": decision,
+                    }
+                )
                 fields["source"] = {
                     "collection_id": f"mai-{family}-generation",
                     "source_record_id": sample_id,
@@ -939,4 +1479,19 @@ def prepare_groups(
                     },
                 }
                 append_sample(group, slot, fields)
+    if review_candidates:
+        _, decisions_path = _write_review_documents(
+            cache_dir,
+            review_policy,
+            review_candidates,
+            review_decisions,
+        )
+    else:
+        decisions_path = _review_paths(cache_dir)[1]
+    if pending_review:
+        raise PipelineError(
+            f"{len(pending_review)} synthetic slots require review; inspect "
+            f"{_review_paths(cache_dir)[0]} and complete {decisions_path}, "
+            "then run Build again (generated candidates will be reused)"
+        )
     return samples, plan

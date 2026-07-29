@@ -118,7 +118,7 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(plan["sample_count"], 3)
         self.assertEqual(plan["missing_credentials"], [])
 
-    def test_camera_search_removes_prompt_scaffolding_and_actions(self) -> None:
+    def test_camera_search_removes_scaffolding_but_keeps_actions(self) -> None:
         group = {
             "prompt": {
                 "text": (
@@ -129,7 +129,7 @@ class PreparationTests(unittest.TestCase):
         }
         self.assertEqual(
             _camera_search_queries(group)[0],
-            "golden retriever green grass",
+            "golden retriever standing in green grass",
         )
 
     def test_adapters_prepare_complete_samples_and_reuse_cache(self) -> None:
@@ -219,6 +219,164 @@ class PreparationTests(unittest.TestCase):
             if sample["origin_class"] == "synthetic"
         ]
         self.assertEqual(len(set(seeds)), 2)
+
+    def test_explicit_review_generates_candidates_then_reuses_them(self) -> None:
+        spec, groups = fixture_spec()
+        spec["dataset"]["prompt_policy"] = {
+            "template_id": "natural-photo-test",
+            "template": "A natural photograph depicting {concept}.",
+        }
+        spec["dataset"]["generation_review"] = {
+            "candidates_per_slot": 2,
+            "require_explicit_decision": True,
+            "selection_method": "explicit-first-passing-v1",
+        }
+        for config in spec["dataset"]["generators"].values():
+            config["model_revision"] = "pinned-revision"
+        calls = {"camera": 0, "generator": 0}
+
+        def camera(
+            group: dict[str, object],
+            config: dict[str, object],
+            target: Path,
+        ) -> dict[str, object]:
+            calls["camera"] += 1
+            make_png(target, (200, 20, 20))
+            return {
+                "source": {
+                    "collection_id": "test-camera",
+                    "source_record_id": "camera-001",
+                    "landing_page_url": "https://example.test/camera-001",
+                    "license": {
+                        "name": "CC-BY-4.0",
+                        "url": "https://creativecommons.org/licenses/by/4.0/",
+                    },
+                },
+                "capture": {
+                    "camera_make": "Test",
+                    "camera_model": "Camera",
+                    "captured_at": "2025-01-01T00:00:00Z",
+                    "edit_screen_status": "pass",
+                },
+                "generation": None,
+                "scope": {"in_scope": True, "ambiguity_flags": []},
+                "audit": {},
+                "provenance": {"kind": "test-camera"},
+            }
+
+        def generator(
+            group: dict[str, object],
+            config: dict[str, object],
+            seed: int | None,
+            target: Path,
+        ) -> dict[str, object]:
+            calls["generator"] += 1
+            make_png(target, (20, calls["generator"], 20))
+            return {
+                "capture": None,
+                "generation": {
+                    "family_id": config["family_id"],
+                    "model_id": config["model_id"],
+                    "model_revision": config["model_revision"],
+                    "provider": "test",
+                    "settings": config["settings"],
+                    "input_image_used": False,
+                    "seed_status": "recorded",
+                    "seed": seed,
+                    "rendered_prompt": group["prompt"]["text"],
+                    "prompt_template_id": group["prompt_policy"]["template_id"],
+                },
+                "scope": {
+                    "in_scope": False,
+                    "ambiguity_flags": ["pending-review"],
+                },
+                "audit": {"review_status": "pending"},
+                "provenance": {
+                    "kind": "test-generation",
+                    "seed": seed,
+                    "prompt": group["prompt"],
+                    "concept": group["concept"],
+                },
+            }
+
+        cache = self.root / "cache"
+        with self.assertRaisesRegex(PipelineError, "require review"):
+            prepare_groups(
+                spec,
+                groups,
+                cache,
+                camera_fetchers={"mock-camera": camera},
+                generator_runners={"mock-generator": generator},
+            )
+        self.assertEqual(calls, {"camera": 1, "generator": 4})
+        candidates = json.loads(
+            (cache / "review/candidates.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(candidates["candidates"]), 2)
+        self.assertTrue((cache / "review/index.html").is_file())
+        decisions_path = cache / "review/decisions.json"
+        decisions = json.loads(decisions_path.read_text(encoding="utf-8"))
+        review_candidates = candidates["candidates"]
+        decisions["decisions"]["group-001-flux-replicate-0"] = {
+            "status": "accepted",
+            "candidate_index": 1,
+            "candidate_sha256": review_candidates[
+                "group-001-flux-replicate-0"
+            ][1]["sha256"],
+            "rejected_candidates": {"0": ["semantic_mismatch"]},
+            "reviewer": "test-reviewer",
+            "reviewed_at": "2026-01-01T00:00:00Z",
+        }
+        decisions["decisions"]["group-001-sd-replicate-0"] = {
+            "status": "accepted",
+            "candidate_index": 0,
+            "candidate_sha256": review_candidates[
+                "group-001-sd-replicate-0"
+            ][0]["sha256"],
+            "rejected_candidates": {},
+            "reviewer": "test-reviewer",
+            "reviewed_at": "2026-01-01T00:00:00Z",
+        }
+        decisions_path.write_text(
+            json.dumps(decisions),
+            encoding="utf-8",
+        )
+        samples, plan = prepare_groups(
+            spec,
+            groups,
+            cache,
+            camera_fetchers={"mock-camera": camera},
+            generator_runners={"mock-generator": generator},
+        )
+        self.assertEqual(calls, {"camera": 1, "generator": 4})
+        self.assertEqual(plan["generation_jobs"], 0)
+        flux = next(
+            sample
+            for sample in samples
+            if sample["slot_id"] == "flux-replicate-0"
+        )
+        self.assertEqual(flux["generation"]["candidate_index"], 1)
+        self.assertEqual(flux["audit"]["review_status"], "accepted")
+        self.assertEqual(
+            flux["prompt"]["text"],
+            "A natural photograph depicting a red cup on a table.",
+        )
+
+        decisions["decisions"]["group-001-flux-replicate-0"][
+            "candidate_sha256"
+        ] = "0" * 64
+        decisions_path.write_text(
+            json.dumps(decisions),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(PipelineError, "candidate_sha256"):
+            prepare_groups(
+                spec,
+                groups,
+                cache,
+                camera_fetchers={"mock-camera": camera},
+                generator_runners={"mock-generator": generator},
+            )
 
     def test_group_driven_build_dry_run_never_calls_adapters(self) -> None:
         spec, _ = fixture_spec()
@@ -431,7 +589,15 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(report["group_count"], 3)
         self.assertEqual(report["sample_count"], 21)
         self.assertEqual(report["preparation"]["camera_downloads"], 3)
-        self.assertEqual(report["preparation"]["generation_jobs"], 18)
+        self.assertEqual(report["preparation"]["generation_jobs"], 72)
+        self.assertEqual(
+            report["preparation"]["generation_candidates_per_slot"],
+            4,
+        )
+        self.assertEqual(
+            report["preparation"]["review_decisions_pending"],
+            18,
+        )
 
 
 if __name__ == "__main__":
