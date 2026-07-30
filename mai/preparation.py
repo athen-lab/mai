@@ -120,6 +120,11 @@ QARunner = Callable[
     dict[str, Any],
 ]
 
+
+class PipelineDependencyError(PipelineError):
+    """A missing local runtime dependency that cannot vary by sample."""
+
+
 LICENSE_ALIASES = {
     "cc-by-4.0": "CC-BY-4.0",
     "cc by 4.0": "CC-BY-4.0",
@@ -395,11 +400,12 @@ def run_moondream_caption(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     try:
+        import accelerate  # noqa: F401
         import torch
         from PIL import Image
         from transformers import AutoModelForCausalLM
     except ImportError as error:
-        raise PipelineError(
+        raise PipelineDependencyError(
             "Moondream dependencies are missing; install with "
             "`python3 -m pip install -e '.[captioning]'`"
         ) from error
@@ -435,7 +441,10 @@ def run_moondream_caption(
             result = _CAPTION_MODEL["model"].caption(
                 image,
                 length=config["length"],
-                settings={"temperature": config["temperature"]},
+                settings={
+                    "temperature": config["temperature"],
+                    "variant": None,
+                },
             )
         except Exception as error:
             raise PipelineError(f"Moondream captioning failed: {error}") from error
@@ -477,7 +486,7 @@ def run_clip_qa(
         from PIL import Image
         from transformers import CLIPModel, CLIPProcessor
     except ImportError as error:
-        raise PipelineError(
+        raise PipelineDependencyError(
             "alignment dependencies are missing; install with "
             "`python3 -m pip install -e '.[alignment]'`"
         ) from error
@@ -1126,11 +1135,14 @@ def run_local_diffusers(
     target: Path,
 ) -> dict[str, Any]:
     try:
+        import accelerate  # noqa: F401
+        import safetensors  # noqa: F401
+        import sentencepiece  # noqa: F401
         import torch
         from diffusers import DiffusionPipeline
         from huggingface_hub import HfApi
     except ImportError as error:
-        raise PipelineError(
+        raise PipelineDependencyError(
             "local generation dependencies are missing; install with "
             "`python3 -m pip install -e '.[generation]'`"
         ) from error
@@ -2241,6 +2253,8 @@ def _prepare_real_photo_groups(
                 normalized_caption,
                 dataset["prompt_policy"],
             )
+        except PipelineDependencyError:
+            raise
         except Exception as error:
             quarantine = _quarantine_group(
                 cache_dir,
@@ -2288,6 +2302,8 @@ def _prepare_real_photo_groups(
                 ),
             )
             cache_hits += int(real_qa.pop("_cache_hit", False))
+        except PipelineDependencyError:
+            raise
         except Exception as error:
             quarantine = _quarantine_group(
                 cache_dir,
@@ -2475,6 +2491,8 @@ def _prepare_real_photo_groups(
                     }
                     if not failures:
                         passing_fields[candidate_index] = fields
+                except PipelineDependencyError:
+                    raise
                 except Exception as error:
                     candidate_record = {
                         "candidate_index": candidate_index,
