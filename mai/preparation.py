@@ -435,6 +435,7 @@ def run_moondream_caption(
             result = _CAPTION_MODEL["model"].caption(
                 image,
                 length=config["length"],
+                settings={"temperature": config["temperature"]},
             )
         except Exception as error:
             raise PipelineError(f"Moondream captioning failed: {error}") from error
@@ -449,6 +450,21 @@ def run_moondream_caption(
         },
         "device": device,
     }
+
+
+def _clip_feature_tensor(value: Any, feature_name: str) -> Any:
+    """Normalize Transformers 4.x tensors and 5.x pooled output wrappers."""
+    pooled = getattr(value, "pooler_output", None)
+    if pooled is not None:
+        return pooled
+    if isinstance(value, dict) and value.get("pooler_output") is not None:
+        return value["pooler_output"]
+    if hasattr(value, "norm"):
+        return value
+    raise PipelineError(
+        f"CLIP {feature_name} features have unsupported type "
+        f"{type(value).__name__}"
+    )
 
 
 def run_clip_qa(
@@ -513,12 +529,18 @@ def run_clip_qa(
         }
         try:
             with torch.inference_mode():
-                image_features = model.get_image_features(
-                    pixel_values=inputs["pixel_values"]
+                image_features = _clip_feature_tensor(
+                    model.get_image_features(
+                        pixel_values=inputs["pixel_values"]
+                    ),
+                    "image",
                 )
-                text_features = model.get_text_features(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs.get("attention_mask"),
+                text_features = _clip_feature_tensor(
+                    model.get_text_features(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs.get("attention_mask"),
+                    ),
+                    "text",
                 )
                 image_features = image_features / image_features.norm(
                     dim=-1,
@@ -1852,14 +1874,10 @@ def _select_hf_sources(
                 qa_key,
                 lambda: qa_runner(path, None, qa_config),
             )
-        except PipelineError as error:
-            _source_rejection(
-                cache_dir,
-                source_id,
-                "qa_exception",
-                {"error": str(error)},
-            )
-            continue
+        except Exception as error:
+            raise PipelineError(
+                f"automated source QA failed for {source_id}: {error}"
+            ) from error
         failures = _qa_failures(
             qa,
             qa_config,
