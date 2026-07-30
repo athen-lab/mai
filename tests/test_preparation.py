@@ -18,9 +18,11 @@ import zlib
 from mai.dataset import PipelineError, build_package
 from mai.preparation import (
     _camera_search_queries,
+    _clip_feature_tensor,
     normalize_caption,
     preparation_plan,
     prepare_groups,
+    run_moondream_caption,
     run_local_diffusers,
 )
 
@@ -784,6 +786,84 @@ class PreparationTests(unittest.TestCase):
             "A red cup, on a table.",
         )
 
+    def test_clip_feature_wrapper_compatibility(self) -> None:
+        tensor = object()
+        self.assertIs(
+            _clip_feature_tensor(
+                types.SimpleNamespace(pooler_output=tensor),
+                "image",
+            ),
+            tensor,
+        )
+        with self.assertRaisesRegex(PipelineError, "unsupported type"):
+            _clip_feature_tensor(object(), "text")
+
+    def test_moondream_receives_zero_temperature(self) -> None:
+        image = self.root / "caption-source.png"
+        make_pattern_png(image, 17)
+        observed: dict[str, object] = {}
+
+        class FakeModel:
+            def eval(self) -> None:
+                return None
+
+            def caption(
+                self,
+                value: object,
+                *,
+                length: str,
+                settings: dict[str, object],
+            ) -> dict[str, str]:
+                observed.update(
+                    {"length": length, "settings": settings}
+                )
+                return {"caption": "A red cup on a table."}
+
+        class FakeAutoModel:
+            @classmethod
+            def from_pretrained(
+                cls,
+                model_id: str,
+                **kwargs: object,
+            ) -> FakeModel:
+                return FakeModel()
+
+        fake_torch = types.SimpleNamespace(
+            __version__="test",
+            float16="float16",
+            float32="float32",
+            manual_seed=lambda seed: None,
+            cuda=types.SimpleNamespace(is_available=lambda: False),
+            backends=types.SimpleNamespace(
+                mps=types.SimpleNamespace(is_available=lambda: False)
+            ),
+        )
+        fake_transformers = types.SimpleNamespace(
+            AutoModelForCausalLM=FakeAutoModel,
+        )
+        from mai import preparation
+
+        preparation._CAPTION_MODEL.clear()
+        with patch.dict(
+            sys.modules,
+            {
+                "torch": fake_torch,
+                "transformers": fake_transformers,
+            },
+        ):
+            result = run_moondream_caption(
+                image,
+                {
+                    "model_id": "test/moondream",
+                    "model_revision": "a" * 40,
+                    "device": "cpu",
+                    "length": "short",
+                    "temperature": 0,
+                },
+            )
+        self.assertEqual(result["raw_caption"], "A red cup on a table.")
+        self.assertEqual(observed["settings"], {"temperature": 0})
+
     def test_v2_offline_adapters_are_deterministic_and_first_passing(
         self,
     ) -> None:
@@ -884,6 +964,31 @@ class PreparationTests(unittest.TestCase):
                 source_loaders={"huggingface-dataset": source_loader},
                 caption_runners={"moondream-local": caption},
                 qa_runners={"clip-local": qa},
+                generator_runners={"local-diffusers": generator},
+            )
+
+    def test_v2_source_qa_exceptions_fail_with_the_root_cause(self) -> None:
+        _, spec, groups, state = self._v2_fixture()
+        source_loader, caption, _, generator = self._v2_adapters(state)
+
+        def broken_qa(
+            path: Path,
+            caption_text: str | None,
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            raise RuntimeError("mock CLIP incompatibility")
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "automated source QA failed.*mock CLIP incompatibility",
+        ):
+            prepare_groups(
+                spec,
+                groups,
+                self.root / "qa-exception-cache",
+                source_loaders={"huggingface-dataset": source_loader},
+                caption_runners={"moondream-local": caption},
+                qa_runners={"clip-local": broken_qa},
                 generator_runners={"local-diffusers": generator},
             )
 
