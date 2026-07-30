@@ -23,13 +23,13 @@ captioning = [
     "huggingface-hub>=0.34,<2",
     "Pillow>=11,<13",
     "torch>=2.1,<3",
-    "transformers>=4.41,<6",
+    "transformers>=4.41,<5",
 ]
 alignment = [
     "huggingface-hub>=0.34,<2",
     "Pillow>=11,<13",
     "torch>=2.1,<3",
-    "transformers>=4.41,<6",
+    "transformers>=4.41,<5",
 ]
 generation = [
     "accelerate>=0.31,<2",
@@ -39,7 +39,7 @@ generation = [
     "safetensors>=0.5,<1",
     "sentencepiece>=0.2,<1",
     "torch>=2.1,<3",
-    "transformers>=4.41,<6",
+    "transformers>=4.41,<5",
 ]
 
 [project.scripts]

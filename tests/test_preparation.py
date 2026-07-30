@@ -10,6 +10,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import tomllib
 import types
 import unittest
 from unittest.mock import patch
@@ -17,6 +18,7 @@ import zlib
 
 from mai.dataset import PipelineError, build_package
 from mai.preparation import (
+    PipelineDependencyError,
     _camera_search_queries,
     _clip_feature_tensor,
     normalize_caption,
@@ -588,6 +590,9 @@ class PreparationTests(unittest.TestCase):
         preparation._LOCAL_MODEL_REVISIONS.clear()
         with (
             patch.dict(sys.modules, {
+                "accelerate": types.ModuleType("accelerate"),
+                "safetensors": types.ModuleType("safetensors"),
+                "sentencepiece": types.ModuleType("sentencepiece"),
                 "torch": fake_torch,
                 "diffusers": fake_diffusers,
                 "huggingface_hub": fake_hub,
@@ -847,6 +852,7 @@ class PreparationTests(unittest.TestCase):
         with patch.dict(
             sys.modules,
             {
+                "accelerate": types.SimpleNamespace(),
                 "torch": fake_torch,
                 "transformers": fake_transformers,
             },
@@ -862,7 +868,10 @@ class PreparationTests(unittest.TestCase):
                 },
             )
         self.assertEqual(result["raw_caption"], "A red cup on a table.")
-        self.assertEqual(observed["settings"], {"temperature": 0})
+        self.assertEqual(
+            observed["settings"],
+            {"temperature": 0, "variant": None},
+        )
 
     def test_v2_offline_adapters_are_deterministic_and_first_passing(
         self,
@@ -952,6 +961,64 @@ class PreparationTests(unittest.TestCase):
                 "all_generated_candidates_failed",
             )
 
+    def test_v2_dependency_failures_are_not_quarantined(self) -> None:
+        _, spec, groups, state = self._v2_fixture()
+        source_loader, _, qa, generator = self._v2_adapters(state)
+
+        def missing_caption_dependency(
+            path: Path,
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            raise PipelineDependencyError(
+                "Moondream dependencies are missing; install captioning"
+            )
+
+        cache = self.root / "dependency-cache"
+        with self.assertRaisesRegex(
+            PipelineError,
+            "Moondream dependencies are missing",
+        ):
+            prepare_groups(
+                spec,
+                groups,
+                cache,
+                source_loaders={"huggingface-dataset": source_loader},
+                caption_runners={
+                    "moondream-local": missing_caption_dependency,
+                },
+                qa_runners={"clip-local": qa},
+                generator_runners={"local-diffusers": generator},
+            )
+        self.assertFalse((cache / "quarantine").exists())
+
+    def test_v2_build_reports_all_quarantined_group_failures(self) -> None:
+        spec_path, _, _, state = self._v2_fixture()
+        source_loader, caption, qa, generator = self._v2_adapters(
+            state,
+            pass_generated=False,
+        )
+        cache = self.root / "build-quarantine-cache"
+        with (
+            patch(
+                "mai.preparation.load_huggingface_rows",
+                source_loader,
+            ),
+            patch("mai.preparation.run_moondream_caption", caption),
+            patch("mai.preparation.run_clip_qa", qa),
+            patch("mai.preparation.run_local_diffusers", generator),
+            self.assertRaisesRegex(
+                PipelineError,
+                "all 3 selected semantic groups were quarantined.*"
+                "generation-qa/all_generated_candidates_failed.*"
+                "inspect receipts",
+            ),
+        ):
+            build_package(
+                spec_path,
+                self.root / "quarantined-package",
+                cache_dir=cache,
+            )
+
     def test_v2_rejects_duplicate_sources_before_split_assignment(self) -> None:
         _, spec, groups, state = self._v2_fixture()
         state["source_rows"][1]["image"] = state["source_rows"][0]["image"]
@@ -1031,6 +1098,16 @@ class PreparationTests(unittest.TestCase):
             "license_policy.allowed",
         ):
             preparation_plan(broken, groups)
+
+    def test_v2_runtime_caps_transformers_below_version_five(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        project = tomllib.loads(
+            (repository / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        extras = project["project"]["optional-dependencies"]
+        for name in ("captioning", "alignment", "generation"):
+            with self.subTest(extra=name):
+                self.assertIn("transformers>=4.41,<5", extras[name])
 
     @unittest.skipUnless(
         shutil.which("magick")

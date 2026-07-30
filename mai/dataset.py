@@ -1570,6 +1570,52 @@ def build_package(
                 resolved_cache,
             )
             samples.extend(prepared)
+            if not samples and preparation.get("quarantine_files"):
+                failures: list[str] = []
+                receipt_paths = [
+                    Path(value).resolve()
+                    for value in preparation["quarantine_files"]
+                ]
+                for receipt_path in receipt_paths:
+                    receipt = read_json(receipt_path)
+                    group_id = str(
+                        receipt.get("semantic_group_id", receipt_path.stem)
+                    )
+                    stage = str(receipt.get("stage", "unknown-stage"))
+                    reason = str(receipt.get("reason", "unknown-reason"))
+                    details = receipt.get("details")
+                    detail = ""
+                    if isinstance(details, dict):
+                        error = details.get("error")
+                        if isinstance(error, str) and error:
+                            detail = f": {error}"
+                        elif isinstance(details.get("failed_slot"), str):
+                            candidate_errors = {
+                                candidate["error"]
+                                for candidate in details.get("candidates", [])
+                                if isinstance(candidate, dict)
+                                and isinstance(candidate.get("error"), str)
+                            }
+                            if len(candidate_errors) == 1:
+                                detail = f": {candidate_errors.pop()}"
+                            else:
+                                detail = (
+                                    f" at slot {details['failed_slot']}"
+                                )
+                        elif isinstance(details.get("failures"), list):
+                            detail = ": " + ", ".join(
+                                str(value) for value in details["failures"]
+                            )
+                    failures.append(
+                        f"{group_id} {stage}/{reason}{detail}"
+                    )
+                receipt_directory = receipt_paths[0].parent
+                raise PipelineError(
+                    f"all {len(receipt_paths)} selected semantic groups were "
+                    "quarantined; "
+                    + "; ".join(failures)
+                    + f"; inspect receipts in {receipt_directory}"
+                )
         else:
             preparation = {
                 "group_count": 0,
